@@ -1,0 +1,4339 @@
+import React,{useState,useMemo,useCallback,useEffect,useRef,Fragment} from "react";
+import ReactDOM from "react-dom/client";
+
+/* ── GOOGLE DRIVE SYNC CONFIG ────────────────────────────────── */
+const GDRIVE_CLIENT_ID = "990972180057-3omua3qvnleek6tfkap09l4i471cub0a.apps.googleusercontent.com";
+const GDRIVE_SCOPE     = "https://www.googleapis.com/auth/drive.appdata";
+const GDRIVE_FILE      = "fizmat-hq-data.json";
+
+let gToken  = null;
+let gFileId = null;
+
+function gAuth(){
+  return new Promise((resolve, reject)=>{
+    if(!window.google||!window.google.accounts){
+      reject(new Error("Google API не загрузился. Обновите страницу.")); return;
+    }
+    const client = google.accounts.oauth2.initTokenClient({
+      client_id: GDRIVE_CLIENT_ID,
+      scope: GDRIVE_SCOPE,
+      callback: r=>{
+        if(r.error){ reject(new Error("Google: "+r.error)); return; }
+        gToken = r.access_token;
+        localStorage.setItem("fhq_gdrive_token", r.access_token);
+        resolve(r.access_token);
+      }
+    });
+    client.requestAccessToken({prompt: "select_account"});
+  });
+}
+
+/* Тихое обновление токена без диалога выбора аккаунта (prompt:"").
+   Используется, когда access-токен протух (живёт ~1 час). */
+function gAuthSilent(){
+  return new Promise((resolve, reject)=>{
+    if(!window.google || !window.google.accounts){ reject(new Error("Google API не загрузился")); return; }
+    let done=false;
+    const client = google.accounts.oauth2.initTokenClient({
+      client_id: GDRIVE_CLIENT_ID,
+      scope: GDRIVE_SCOPE,
+      callback: r=>{
+        done=true;
+        if(r.error){ reject(new Error("Google: "+r.error)); return; }
+        gToken = r.access_token;
+        localStorage.setItem("fhq_gdrive_token", r.access_token);
+        resolve(r.access_token);
+      },
+      error_callback: e=>{ done=true; reject(new Error((e&&e.type)||"auth_error")); }
+    });
+    try{ client.requestAccessToken({prompt: ""}); }catch(e){ reject(e); }
+    setTimeout(()=>{ if(!done) reject(new Error("silent auth timeout")); }, 8000);
+  });
+}
+
+/* Обёртка над fetch к Google: сама подставляет Authorization и при 401/403
+   один раз тихо обновляет токен и повторяет запрос. */
+async function gFetch(url, opts, _retried){
+  opts = opts || {};
+  const token = gToken || localStorage.getItem("fhq_gdrive_token");
+  const headers = Object.assign({}, opts.headers, {Authorization: "Bearer "+token});
+  const r = await fetch(url, Object.assign({}, opts, {headers}));
+  if((r.status===401 || r.status===403) && !_retried){
+    try{ await gAuthSilent(); }
+    catch(e){ throw new Error("Токен Google истёк — войдите заново. ("+(e&&e.message||e)+")"); }
+    return gFetch(url, opts, true);
+  }
+  return r;
+}
+
+/* ── GOOGLE CALENDAR (двусторонний обмен, вручную, только добавление) ─────────
+   Доступ к календарю запрашивается ОТДЕЛЬНО и по требованию — вход через Google
+   Диск это не затрагивает. Всё аддитивно: кнопки только создают события и ничего
+   не удаляют, поэтому худшее возможное последствие — дубликат, но не потеря данных.
+   Требуется включённый Google Calendar API и разрешённый scope в вашем OAuth-проекте. */
+const GCAL_SCOPE = "https://www.googleapis.com/auth/calendar.events";
+let gCalTok = null;
+function gCalAuth(interactive){
+  return new Promise((resolve,reject)=>{
+    if(!window.google || !window.google.accounts || !window.google.accounts.oauth2){
+      reject(new Error("Google API не загрузился. Обновите страницу.")); return;
+    }
+    try{
+      const client = google.accounts.oauth2.initTokenClient({
+        client_id: GDRIVE_CLIENT_ID,
+        scope: GCAL_SCOPE,
+        callback: (r)=>{ if(r&&r.error){reject(new Error("Google: "+r.error));return;} gCalTok=r.access_token; resolve(gCalTok); }
+      });
+      client.requestAccessToken({prompt: interactive?"consent":""});
+    }catch(e){ reject(e); }
+  });
+}
+async function gcalFetch(url, opts){
+  opts = opts || {};
+  if(!gCalTok) await gCalAuth(true);
+  const doFetch = ()=>fetch(url, Object.assign({}, opts, {headers: Object.assign({}, opts.headers, {Authorization:"Bearer "+gCalTok})}));
+  let res = await doFetch();
+  if(res.status===401 || res.status===403){
+    try{ await gCalAuth(true); }
+    catch(e){ throw new Error("Нет доступа к Google Календарю. Проверьте, что включён Calendar API. ("+(e&&e.message||e)+")"); }
+    res = await doFetch();
+  }
+  return res;
+}
+
+async function gGetFileId(token){
+  if(gFileId) return gFileId;
+  const q = encodeURIComponent("name='"+GDRIVE_FILE+"' and trashed=false");
+  const r = await gFetch(
+    "https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q="+q+"&fields=files(id)"
+  );
+  if(!r.ok){
+    const err = await r.text();
+    console.error("Drive search error:", r.status, err);
+    throw new Error("Drive search "+r.status+": "+err.slice(0,200));
+  }
+  const j = await r.json();
+  if(j.files && j.files.length > 0){ gFileId = j.files[0].id; return gFileId; }
+  return null;
+}
+
+async function gSave(data){
+  const token = gToken || localStorage.getItem("fhq_gdrive_token");
+  if(!token) throw new Error("Нет токена. Войдите через Google.");
+  console.log("gSave: saving",Object.keys(data).length,"collections to Drive...");
+  const body = JSON.stringify(data);
+  let fileId = await gGetFileId(token);
+  console.log("gSave: fileId="+fileId);
+  if(fileId){
+    const r = await gFetch(
+      "https://www.googleapis.com/upload/drive/v3/files/"+fileId+"?uploadType=media",
+      {method:"PATCH", headers:{"Content-Type":"application/json"}, body}
+    );
+    if(!r.ok) throw new Error("Drive PATCH "+r.status);
+  } else {
+    const meta = await gFetch("https://www.googleapis.com/drive/v3/files", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({name:GDRIVE_FILE, parents:["appDataFolder"]})
+    });
+    const created = await meta.json();
+    if(!created.id) throw new Error("Drive create failed: "+JSON.stringify(created));
+    gFileId = created.id;
+    await gFetch(
+      "https://www.googleapis.com/upload/drive/v3/files/"+created.id+"?uploadType=media",
+      {method:"PATCH", headers:{"Content-Type":"application/json"}, body}
+    );
+  }
+}
+
+async function gLoad(token){
+  console.log("gLoad: searching for file...");
+  const fileId = await gGetFileId(token);
+  if(!fileId){console.log("gLoad: no file on Drive yet (first time)");return null;}
+  console.log("gLoad: found fileId="+fileId+", downloading...");
+  const r = await gFetch(
+    "https://www.googleapis.com/drive/v3/files/"+fileId+"?alt=media"
+  );
+  if(!r.ok) throw new Error("Drive GET "+r.status);
+  const data = await r.json();
+  console.log("gLoad: success, students="+( data.students&&data.students.length));
+  return data;
+}
+
+/* ── IndexedDB-зеркало ────────────────────────────────────────
+   Дублирует данные из localStorage. Переживает «очистку кэша сайта»
+   надёжнее, чем localStorage, и снимает потолок в ~5 МБ. Работает
+   best-effort: любая ошибка молча игнорируется. */
+const IDB_NAME="fizmat-hq", IDB_STORE="kv";
+let _idbP=null;
+function idbOpen(){
+  if(_idbP) return _idbP;
+  _idbP=new Promise((res)=>{
+    try{
+      const rq=indexedDB.open(IDB_NAME,1);
+      rq.onupgradeneeded=()=>{ try{ rq.result.createObjectStore(IDB_STORE); }catch{} };
+      rq.onsuccess=()=>res(rq.result);
+      rq.onerror=()=>res(null);
+    }catch{ res(null); }
+  });
+  return _idbP;
+}
+async function idbSet(k,v){
+  const db=await idbOpen(); if(!db) return;
+  return new Promise(res=>{ try{ const tx=db.transaction(IDB_STORE,"readwrite"); tx.objectStore(IDB_STORE).put(v,k); tx.oncomplete=()=>res(); tx.onerror=()=>res(); }catch{ res(); } });
+}
+async function idbGet(k){
+  const db=await idbOpen(); if(!db) return undefined;
+  return new Promise(res=>{ try{ const tx=db.transaction(IDB_STORE,"readonly"); const rq=tx.objectStore(IDB_STORE).get(k); rq.onsuccess=()=>res(rq.result); rq.onerror=()=>res(undefined); }catch{ res(undefined); } });
+}
+
+/* Объединяет два массива записей по id (union). Сохраняет обе стороны;
+   при совпадении id берёт запись с более свежим updatedAt, иначе — облачную.
+   Именно это устраняет затирание данных при работе с двух устройств. */
+function mergeById(local,cloud){
+  if(!Array.isArray(local)) return Array.isArray(cloud)?cloud:local;
+  if(!Array.isArray(cloud)) return local;
+  const byId=new Map(), noId=[], seen=new Set();
+  const push=(it,fromCloud)=>{
+    if(it && it.id!=null){
+      const k=String(it.id), ex=byId.get(k);
+      if(!ex){ byId.set(k,it); return; }
+      const a=Date.parse(ex.updatedAt||ex.createdAt||"")||0;
+      const b=Date.parse(it.updatedAt||it.createdAt||"")||0;
+      byId.set(k, (fromCloud? b>=a : b>a) ? it : ex);
+    } else {
+      const sig=JSON.stringify(it);           // без id — дедуп по содержимому
+      if(!seen.has(sig)){ seen.add(sig); noId.push(it); }
+    }
+  };
+  local.forEach(it=>push(it,false));
+  cloud.forEach(it=>push(it,true));
+  return [...byId.values(), ...noId];
+}
+
+/* Баннер о неудачной записи в localStorage (переполнено хранилище). */
+let _storageWarned=false;
+function warnStorage(){
+  if(_storageWarned) return; _storageWarned=true;
+  try{
+    const b=document.getElementById("errbox");
+    if(b){ b.style.display="block"; b.style.background="#C47C00";
+      b.textContent="⚠ Не удалось сохранить в память браузера — возможно, переполнено хранилище. Сделайте резервную копию: Настройки → Экспорт данных."; }
+  }catch{}
+}
+
+function useDevice() {
+  const[w,setW]=useState(window.innerWidth);
+  useEffect(()=>{
+    let raf=0;
+    const h=()=>{ if(raf) return; raf=requestAnimationFrame(()=>{ raf=0; setW(window.innerWidth); }); };
+    window.addEventListener("resize",h);
+    return()=>{ window.removeEventListener("resize",h); if(raf) cancelAnimationFrame(raf); };
+  },[]);
+  return { isMobile:w<768, isTablet:w>=768&&w<1200, isDesktop:w>=1200, width:w };
+}
+
+/* ── CONSTANTS ───────────────────────────────────────────────── */
+const SUBJECTS=["Физика","Математика","Информатика","Химия","Другое"];
+const CONTACT_TYPES=["Telegram","WhatsApp","Телефон","Email","VK"];
+const DS=["Пн","Вт","Ср","Чт","Пт","Сб","Вс"];
+const DF=["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"];
+const MR=["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"];
+const MN=["Январь","Февраль","Март","Апрель","Май","Июнь","Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"];
+const CAL_START=8, CAL_END=22;
+const CAL_HOURS=Array.from({length:CAL_END-CAL_START},(_,i)=>CAL_START+i);
+const ET=[
+  {v:"lesson",l:"Урок",c:"#2C5EE8"},
+  {v:"work",l:"Работа",c:"#7C3AED"},
+  {v:"study",l:"Учёба",c:"#C47C00"},
+  {v:"personal",l:"Личное",c:"#2A9D5C"},
+  {v:"project",l:"Проект",c:"#5B5BD6"},
+  {v:"important",l:"Важное",c:"#D63A3A"}
+];
+const EV_ST={planned:"Запланировано",done:"Проведено",cancelled:"Отменено",moved:"Перенесено",missed:"Неявка"};
+const ECATS=["Техника","Транспорт","Обучение","Подписки","Реклама","Личные","Другое"];
+const PMETHODS=["После каждого занятия","Раз в 2 недели (после)","За 2 недели вперёд","За месяц вперёд","В конце месяца","Свободный график"];
+const PRC={high:"#D63A3A",medium:"#C47C00",low:"#2A9D5C"};
+const PRL={high:"Высокий",medium:"Средний",low:"Низкий"};
+const TST={planned:"Запланировано",inprogress:"В работе",done:"Выполнено"};
+const KBT={"Физика":["7 кл","8 кл","9 кл","10 кл","11 кл"],"Математика":["Алгебра","Геометрия","Теорвер"],"Другое":["Общее","Методика"]};
+const BTAGS=["Физика","Математика","Уроки","Telegram","Личное","Проект","Идея","Методика"];
+const SUBJ_COLORS={"Физика":"#2C5EE8","Математика":"#7C3AED","Информатика":"#2A9D5C","Химия":"#C47C00","Другое":"#636366"};
+
+/* ── STORE ───────────────────────────────────────────────────── */
+function useStore(key,def){
+  const[v,sv]=useState(()=>{try{const x=localStorage.getItem(key);return x?JSON.parse(x):def;}catch{return def;}});
+  // Если в localStorage пусто (напр. после очистки кэша) — поднимаем из IndexedDB.
+  useEffect(()=>{
+    let alive=true;
+    try{
+      if(localStorage.getItem(key)==null){
+        idbGet(key).then(val=>{
+          if(alive && val!=null){ try{ sv(JSON.parse(val)); localStorage.setItem(key,val); }catch{} }
+        });
+      }
+    }catch{}
+    return()=>{ alive=false; };
+  },[key]);
+  const set=useCallback(nv=>{
+    sv(prev=>{
+      const r=typeof nv==="function"?nv(prev):nv;
+      const s=JSON.stringify(r);
+      try{ localStorage.setItem(key,s); }catch{ warnStorage(); }
+      idbSet(key,s); // зеркало best-effort
+      return r;
+    });
+  },[key]);
+  return[v,set];
+}
+
+/* ── UTILS ───────────────────────────────────────────────────── */
+const pad2=n=>String(n).padStart(2,"0");
+const localYMD=d=>`${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
+const localYM=d=>`${d.getFullYear()}-${pad2(d.getMonth()+1)}`;
+const today=()=>localYMD(new Date());
+const sameId=(a,b)=>String(a)===String(b);
+const fmtD=d=>{try{return new Date(d).toLocaleDateString("ru-RU",{day:"numeric",month:"short"});}catch{return d;}};
+const fmtM=n=>Number(n||0).toLocaleString("ru-RU");
+const evc=t=>ET.find(x=>x.v===t)?.c||"#2C5EE8";
+const evl=t=>ET.find(x=>x.v===t)?.l||t;
+function getWeek(off=0){
+  const n=new Date(),d=n.getDay(),m=new Date(n);
+  m.setDate(n.getDate()-(d===0?6:d-1)+off*7);
+  return Array.from({length:7},(_,i)=>{const x=new Date(m);x.setDate(m.getDate()+i);return x;});
+}
+const iso=d=>localYMD(d);
+const dim=(y,m)=>new Date(y,m+1,0).getDate();
+const fdm=(y,m)=>{const d=new Date(y,m,1).getDay();return d===0?6:d-1;};
+function useDebounce(v,ms){const[dv,sd]=useState(v);useEffect(()=>{const t=setTimeout(()=>sd(v),ms);return()=>clearTimeout(t);},[v,ms]);return dv;}
+const toMin=t=>{if(!t)return 0;const[h,m]=(t||"0:0").split(":").map(Number);return h*60+(m||0);};
+const addMin=(t,m)=>{if(!t)return"--:--";try{const d=new Date(`2000-01-01T${t.slice(0,5)}`);d.setMinutes(d.getMinutes()+Number(m)||0);return d.toTimeString().slice(0,5);}catch{return"--:--";}};
+function useHourH(){ return 60; }
+
+function genRec(rls,excs,students,from,to){
+  const res=[],f=new Date(from),t=new Date(to);
+  rls.filter(r=>r.active).forEach(r=>{
+    const st=students.find(s=>s.id===r.studentId);
+    const cur=new Date(f);
+    while(cur<=t){
+      const wd=cur.getDay()===0?7:cur.getDay();
+      if(wd===r.weekday){
+        const dk=iso(cur);
+        if((!r.startDate||dk>=r.startDate)&&(!r.endDate||dk<=r.endDate)&&!excs.some(e=>e.recurringId===r.id&&e.date===dk))
+          res.push({id:`rec_${r.id}_${dk}`,isRecurring:true,recurringId:r.id,
+            studentId:r.studentId,title:st?.name||"Урок",type:"lesson",date:dk,
+            time:r.time,duration:r.duration,status:"planned",
+            price:r.priceOverride!=null?r.priceOverride:(st?.price||0)});
+      }
+      cur.setDate(cur.getDate()+1);
+    }
+  });
+  return res;
+}
+
+function layoutEvents(evs){
+  const es=evs.map(e=>({...e,_s:toMin(e.time),_e:toMin(e.time)+(Number(e.duration)||60)}));
+  es.sort((a,b)=>a._s-b._s||(a.id>b.id?1:-1));
+  const colEnds=[];
+  es.forEach(ev=>{
+    let col=-1;
+    for(let i=0;i<colEnds.length;i++){if(colEnds[i]<=ev._s){col=i;break;}}
+    if(col===-1){col=colEnds.length;colEnds.push(0);}
+    colEnds[col]=ev._e;ev._col=col;
+  });
+  const total=Math.max(1,colEnds.length);
+  return es.map(ev=>({...ev,_total:total}));
+}
+
+/* ── DESIGN TOKENS (CSS-var proxy) ──────────────────────────── */
+const T={
+  bg:"var(--bg)",surface:"var(--surface)",surface2:"var(--surface2)",
+  text:"var(--text)",t2:"var(--t2)",t3:"var(--t3)",
+  border:"var(--border)",border2:"var(--border2)",
+  accent:"var(--accent)",accent2:"var(--accent2)",
+  gold:"var(--gold)",green:"var(--green)",red:"var(--red)",amber:"var(--amber)",
+  shadow:"var(--shadow-sm)",shadowMd:"var(--shadow-md)",shadowLg:"var(--shadow-lg)",shadowAccent:"var(--shadow-accent)",
+};
+
+/* ── UI COMPONENTS (дизайн из index (2)) ───────────────────── */
+function Card({children,style={},onClick,hover=false,pad=20,glass=false}){
+  return(
+    <div
+      onClick={onClick}
+      className={hover?"card-hover":""}
+      style={{
+        background: glass?"rgba(255,255,255,0.72)":T.surface,
+        backdropFilter: glass?"blur(20px)":"none",
+        borderRadius:16,
+        boxShadow:T.shadow,
+        padding:pad,
+        border:`1px solid ${T.border}`,
+        cursor:onClick?(hover?"pointer":"pointer"):undefined,
+        ...style
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function Badge({color="#2C5EE8",children,size="sm",dot=false,outlined=false}){
+  const pad=size==="sm"?"2px 8px":"4px 13px";
+  const fs=size==="sm"?11:12;
+  return(
+    <span style={{
+      background:outlined?"transparent":color+"15",
+      color,border:outlined?`1px solid ${color}50`:"none",
+      borderRadius:99,padding:pad,fontSize:fs,fontWeight:600,
+      whiteSpace:"nowrap",display:"inline-flex",alignItems:"center",gap:4,letterSpacing:"-0.01em"
+    }}>
+      {dot&&<span style={{width:5,height:5,borderRadius:"50%",background:color,flexShrink:0}}/>}
+      {children}
+    </span>
+  );
+}
+
+function Btn({children,onClick,variant="primary",size="md",style={},disabled}){
+  const[hover,setHover]=useState(false);
+  const sizes={sm:{padding:"5px 14px",fontSize:12,borderRadius:8},md:{padding:"9px 20px",fontSize:14,borderRadius:10}};
+  const sz=sizes[size]||sizes.md;
+  const variants={
+    primary:{background:hover?"#1E4DD4":T.accent,color:"#fff",boxShadow:hover?"0 4px 16px rgba(44,94,232,0.35)":"0 2px 8px rgba(44,94,232,0.2)"},
+    secondary:{background:hover?T.surface2:T.surface,color:T.text,border:`1px solid ${T.border}`,boxShadow:T.shadow},
+    ghost:{background:hover?"rgba(0,0,0,0.04)":"transparent",color:T.t2},
+    danger:{background:hover?"#FEE2E2":"#FEF2F2",color:T.red,border:`1px solid ${T.red}20`},
+    gold:{background:"linear-gradient(135deg,#C9A84C,#A07A30)",color:"#fff",boxShadow:"0 2px 12px rgba(201,168,76,0.3)"},
+  };
+  const vStyle=variants[variant]||variants.primary;
+  return(
+    <button
+      disabled={disabled}
+      onClick={onClick}
+      onMouseEnter={()=>setHover(true)}
+      onMouseLeave={()=>setHover(false)}
+      style={{
+        border:"none",fontWeight:600,cursor:disabled?"not-allowed":"pointer",
+        transition:"all 0.15s ease",opacity:disabled?0.45:1,letterSpacing:"-0.01em",
+        fontFamily:"var(--font)",outline:"none",
+        ...sz,...vStyle,...style
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Inp({value,onChange,placeholder,type="text",style={}}){
+  const[focused,setFocused]=useState(false);
+  return(
+    <input
+      value={value||""}
+      onChange={e=>onChange(e.target.value)}
+      type={type}
+      placeholder={placeholder}
+      onFocus={()=>setFocused(true)}
+      onBlur={()=>setFocused(false)}
+      style={{
+        width:"100%",
+        border:`1.5px solid ${focused?T.accent:T.border}`,
+        borderRadius:10,
+        padding:"9px 13px",
+        fontSize:14,
+        color:T.text,
+        outline:"none",
+        background:T.surface,
+        boxSizing:"border-box",
+        transition:"border-color 0.15s ease",
+        boxShadow:focused?"0 0 0 3px rgba(44,94,232,0.1)":"none",
+        ...style
+      }}
+    />
+  );
+}
+
+function Txa({value,onChange,placeholder,rows=3}){
+  return(
+    <textarea
+      value={value||""}
+      onChange={e=>onChange(e.target.value)}
+      placeholder={placeholder}
+      rows={rows}
+      style={{
+        width:"100%",border:`1.5px solid ${T.border}`,borderRadius:10,
+        padding:"9px 13px",fontSize:14,color:T.text,outline:"none",
+        background:T.surface,boxSizing:"border-box",lineHeight:1.6,resize:"vertical",
+        transition:"border-color 0.15s"
+      }}
+    />
+  );
+}
+
+function Sel({value,onChange,options}){
+  return(
+    <select
+      value={value??""}
+      onChange={e=>onChange(e.target.value)}
+      style={{
+        width:"100%",border:`1.5px solid ${T.border}`,borderRadius:10,
+        padding:"9px 13px",fontSize:14,color:T.text,outline:"none",
+        background:T.surface,appearance:"auto",cursor:"pointer"
+      }}
+    >
+      {options.map(o=><option key={o.v??o} value={o.v??o}>{o.l??o}</option>)}
+    </select>
+  );
+}
+
+function Toggle({on,onChange,label}){
+  return(
+    <label className="toggle-wrap" onClick={()=>onChange(!on)}>
+      <div className={`toggle-track ${on?"on":""}`}>
+        <div className={`toggle-thumb ${on?"on":""}`}/>
+      </div>
+      {label&&<span style={{fontSize:13,color:T.t2,fontWeight:500}}>{label}</span>}
+    </label>
+  );
+}
+
+function Modal({title,onClose,children,wide}) {
+  const{isMobile}=useDevice();
+  useEffect(()=>{
+    const h=e=>{if(e.key==="Escape")onClose();};
+    document.body.style.overflow="hidden";
+    window.addEventListener("keydown",h);
+    return()=>{document.body.style.overflow="";window.removeEventListener("keydown",h);};
+  },[onClose]);
+
+  return(
+    <div onClick={onClose}
+      style={{position:"fixed",inset:0,background:"var(--modal-bg)",zIndex:400,
+        display:"flex",alignItems:isMobile?"flex-end":"center",justifyContent:"center",
+        padding:isMobile?0:16,backdropFilter:"blur(8px)"}}>
+      <div onClick={e=>e.stopPropagation()}
+        className={isMobile?"bottom-sheet":""}
+        style={{
+          background:"var(--surface)",
+          borderRadius:isMobile?"20px 20px 0 0":20,
+          padding:isMobile?"20px 18px 32px":28,
+          width:"100%",maxWidth:isMobile?"100%":(wide?600:470),
+          boxShadow:"0 24px 64px rgba(0,0,0,0.16)",
+          maxHeight:isMobile?"92vh":"92vh",overflowY:"auto",
+          border:isMobile?"none":`1px solid ${T.border}`
+        }}>
+        {isMobile&&<div style={{width:40,height:4,borderRadius:99,background:"var(--border)",margin:"0 auto 16px"}}/>}
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+          <div style={{fontSize:17,fontWeight:700,letterSpacing:"-0.03em"}}>{title}</div>
+          <button onClick={onClose}
+            style={{background:"var(--surface2)",border:`1px solid ${T.border}`,width:28,height:28,borderRadius:7,cursor:"pointer",color:"var(--t3)",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center",lineHeight:1}}>×</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function Field({label,children,required}){
+  return(
+    <div style={{marginBottom:14}}>
+      <div style={{fontSize:11,fontWeight:600,color:T.t3,marginBottom:6,textTransform:"uppercase",letterSpacing:"0.06em"}}>
+        {label}{required&&<span style={{color:T.red,marginLeft:3}}>*</span>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function G2({children,gap=12}){
+  return <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap}}>{children}</div>;
+}
+
+function SaveRow({onClose,onSave,onDelete}){
+  return(
+    <div style={{display:"flex",gap:8,marginTop:20,paddingTop:16,borderTop:`1px solid ${T.border}`}}>
+      {onDelete&&<Btn variant="danger" onClick={onDelete} size="sm">Удалить</Btn>}
+      <div style={{flex:1}}/>
+      <Btn variant="secondary" onClick={onClose} size="sm">Отмена</Btn>
+      <Btn onClick={onSave} size="sm">Сохранить</Btn>
+    </div>
+  );
+}
+
+function PBar({cur,goal,color="#2C5EE8",h=5}){
+  const p=goal>0?Math.min(100,Math.round(Number(cur)/Number(goal)*100)):0;
+  return(
+    <div>
+      <div style={{height:h,background:"rgba(0,0,0,0.06)",borderRadius:99,overflow:"hidden"}}>
+        <div style={{height:"100%",width:`${p}%`,background:color,borderRadius:99,transition:"width 0.6s cubic-bezier(0.4,0,0.2,1)"}}/>
+      </div>
+      <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:T.t2,marginTop:3}}>
+        <span style={{fontWeight:500}}>{goal>999?`${fmtM(cur)} / ${fmtM(goal)} ₽`:`${cur} / ${goal}`}</span>
+        <span style={{fontWeight:700,color}}>{p}%</span>
+      </div>
+    </div>
+  );
+}
+
+function Empty({text,sub}){
+  return(
+    <div style={{textAlign:"center",padding:"40px 20px",color:T.t3}}>
+      <div style={{
+        width:48,height:48,borderRadius:14,
+        background:T.surface2,border:`1px solid ${T.border}`,
+        display:"flex",alignItems:"center",justifyContent:"center",
+        margin:"0 auto 12px",
+        fontSize:20,color:T.t3
+      }}>—</div>
+      <div style={{fontSize:13,fontWeight:600,color:T.t2,marginBottom:4}}>{text}</div>
+      {sub&&<div style={{fontSize:12,color:T.t3}}>{sub}</div>}
+    </div>
+  );
+}
+
+function SH({title,sub,children}){
+  return(
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:22}}>
+      <div>
+        <div style={{fontSize:22,fontWeight:800,letterSpacing:"-0.04em",color:T.text}}>{title}</div>
+        {sub&&<div style={{fontSize:12,color:T.t3,marginTop:2,fontWeight:400}}>{sub}</div>}
+      </div>
+      <div style={{display:"flex",gap:8}}>{children}</div>
+    </div>
+  );
+}
+
+/* ── CHARTS ──────────────────────────────────────────────────── */
+function DonutChart({segments,size=160,stroke=18,label,sublabel}){
+  const r=(size-stroke)/2;
+  const circ=2*Math.PI*r;
+  const total=segments.reduce((s,x)=>s+(x.value||0),0)||1;
+  let offset=0;
+  const arcs=segments.map(seg=>{
+    const pct=(seg.value||0)/total;
+    const dash=pct*circ;
+    const arc={...seg,dash,offset,startDeg:offset/circ*360};
+    offset+=dash;
+    return arc;
+  });
+  return(
+    <div style={{position:"relative",display:"inline-flex",alignItems:"center",justifyContent:"center"}}>
+      <svg width={size} height={size} style={{transform:"rotate(-90deg)"}}>
+        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={T.surface2} strokeWidth={stroke}/>
+        {arcs.map((arc,i)=>(
+          <circle
+            key={i}
+            cx={size/2} cy={size/2} r={r}
+            fill="none"
+            stroke={arc.color}
+            strokeWidth={stroke}
+            strokeDasharray={`${arc.dash} ${circ}`}
+            strokeDashoffset={-arc.offset}
+            strokeLinecap="round"
+            className="ring-path"
+            style={{transitionDelay:`${i*0.08}s`}}
+          />
+        ))}
+      </svg>
+      {(label||sublabel)&&(
+        <div style={{
+          position:"absolute",textAlign:"center",
+          pointerEvents:"none"
+        }}>
+          {label&&<div style={{fontSize:20,fontWeight:800,letterSpacing:"-0.04em",color:T.text,lineHeight:1}}>{label}</div>}
+          {sublabel&&<div style={{fontSize:11,color:T.t3,marginTop:3,fontWeight:500}}>{sublabel}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BarChart({data,height=120,color,valueKey="v",labelKey="l",currency=false,animated=true}){
+  const max=Math.max(...data.map(x=>x[valueKey]||0),1);
+  return(
+    <div style={{display:"flex",gap:6,alignItems:"flex-end",height}}>
+      {data.map((x,i)=>{
+        const val=x[valueKey]||0;
+        const barH=Math.max(3,(val/max)*(height-28));
+        const isActive=x.active;
+        return(
+          <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+            {val>0&&(
+              <div style={{fontSize:9,color:T.t2,fontWeight:700,letterSpacing:"-0.01em"}}>
+                {currency?(val>9999?`${Math.round(val/1000)}к`:fmtM(val)):val}
+              </div>
+            )}
+            <div style={{
+              width:"100%",
+              background:isActive?x.color||color:color||(x.color||T.accent),
+              borderRadius:"4px 4px 0 0",
+              height:barH,
+              opacity:isActive?1:(val>0?0.6:0.15),
+              transition:animated?"height 0.5s cubic-bezier(0.4,0,0.2,1)":"none",
+            }}/>
+            <div style={{fontSize:9,color:T.t3,fontWeight:500,textAlign:"center",lineHeight:1.2}}>
+              {x[labelKey]||x.m?.slice(5)||x.d||""}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function LineChart({data,height=100,color="#2C5EE8",valueKey="v",labelKey="l",fill=true}){
+  if(!data||data.length<2)return<div style={{height,display:"flex",alignItems:"center",justifyContent:"center",color:T.t3,fontSize:12}}>Мало данных</div>;
+  const max=Math.max(...data.map(x=>x[valueKey]||0),1);
+  const min=Math.min(...data.map(x=>x[valueKey]||0),0);
+  const range=Math.max(max-min,1);
+  const w=300,h=height-24;
+  const pts=data.map((x,i)=>{
+    const px=(i/(data.length-1))*w;
+    const py=h-(((x[valueKey]||0)-min)/range)*h;
+    return[px,py];
+  });
+  const poly=pts.map(p=>p.join(",")).join(" ");
+  const area=`M${pts[0][0]},${h} ${pts.map(p=>`L${p[0]},${p[1]}`).join(" ")} L${pts[pts.length-1][0]},${h} Z`;
+  return(
+    <div style={{width:"100%"}}>
+      <svg viewBox={`0 0 ${w} ${height}`} style={{width:"100%",overflow:"visible"}}>
+        <defs>
+          <linearGradient id={`grad_${color.replace("#","")}`} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={color} stopOpacity="0.18"/>
+            <stop offset="100%" stopColor={color} stopOpacity="0"/>
+          </linearGradient>
+        </defs>
+        {fill&&<path d={area} fill={`url(#grad_${color.replace("#","")})`}/>}
+        <polyline points={poly} fill="none" stroke={color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="line-path"/>
+        {pts.map(([px,py],i)=>(
+          <circle key={i} cx={px} cy={py} r={3.5} fill={T.surface} stroke={color} strokeWidth={2}/>
+        ))}
+        {data.map((x,i)=>(
+          <text key={i} x={pts[i][0]} y={height-2} textAnchor="middle" fontSize="9" fill={T.t3} fontWeight="500">
+            {x[labelKey]||x.m?.slice(5)||""}
+          </text>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+function RingGauge({pct,color,size=80,stroke=8,label,sublabel}){
+  const r=(size-stroke*2)/2;
+  const circ=2*Math.PI*r;
+  const dash=Math.max(0,circ*(Math.min(pct,100)/100));
+  return(
+    <div style={{display:"inline-flex",flexDirection:"column",alignItems:"center",gap:6}}>
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} style={{flexShrink:0}}>
+        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="rgba(0,0,0,0.06)" strokeWidth={stroke}/>
+        <circle
+          cx={size/2} cy={size/2} r={r} fill="none"
+          stroke={color} strokeWidth={stroke}
+          strokeDasharray={`${dash} ${circ}`}
+          strokeLinecap="round"
+          transform={`rotate(-90 ${size/2} ${size/2})`}
+          style={{transition:"stroke-dasharray 0.8s cubic-bezier(0.4,0,0.2,1)"}}
+        />
+        <text x={size/2} y={size/2+4} textAnchor="middle" fontSize={12} fontWeight={800} fill={color} letterSpacing="-0.03em">
+          {pct}%
+        </text>
+      </svg>
+      {label&&<div style={{fontSize:11,fontWeight:600,color:T.t2,textAlign:"center"}}>{label}</div>}
+      {sublabel&&<div style={{fontSize:10,color:T.t3,textAlign:"center"}}>{sublabel}</div>}
+    </div>
+  );
+}
+
+/* ── AUTH SCREEN ────────────────────────────────────────────── */
+function AuthScreen({onAuth}){
+  const[status,setStatus]=useState("idle");
+  const[err,setErr]=useState("");
+
+  async function loginGoogle(){
+    if(GDRIVE_CLIENT_ID==="YOUR_GOOGLE_CLIENT_ID"){
+      setErr("Вставьте ваш Google Client ID в начало файла. Инструкция в ИНСТРУКЦИЯ.md");
+      return;
+    }
+    setStatus("loading"); setErr("");
+    try{
+      const token = await gAuth();
+      onAuth({token, type:"google"});
+    } catch(e){
+      setStatus("error");
+      setErr("Ошибка входа: "+e.message);
+    }
+  }
+
+  return(
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"var(--bg)",padding:20}}>
+      <div style={{width:"100%",maxWidth:360,background:"var(--surface)",borderRadius:20,padding:32,boxShadow:"var(--shadow-lg)",border:"1px solid var(--border)"}}>
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:28}}>
+          <div style={{width:40,height:40,background:"linear-gradient(135deg,#2563EB,#7C3AED)",borderRadius:12,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,fontWeight:900,color:"#fff",boxShadow:"0 4px 16px rgba(37,99,235,.4)"}}>F</div>
+          <div>
+            <div style={{fontSize:17,fontWeight:800,letterSpacing:"-0.04em"}}>FizMat HQ</div>
+            <div style={{fontSize:11,color:"var(--t3)"}}>Штаб репетитора</div>
+          </div>
+        </div>
+
+        <div style={{fontSize:20,fontWeight:700,marginBottom:6,letterSpacing:"-0.03em"}}>Войти в приложение</div>
+        <div style={{fontSize:13,color:"var(--t2)",marginBottom:24}}>Данные будут храниться на вашем Google Диске — в скрытой папке приложения</div>
+
+        {err&&<div style={{background:"#FEF2F2",color:"var(--red)",borderRadius:10,padding:"10px 14px",fontSize:12,marginBottom:16,border:"1px solid rgba(220,38,38,.12)",lineHeight:1.5}}>{err}</div>}
+
+        <button onClick={loginGoogle} disabled={status==="loading"}
+          style={{width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:12,background:"#fff",color:"#1f1f1f",border:"1.5px solid #dadce0",borderRadius:12,padding:"13px 20px",fontSize:15,fontWeight:600,cursor:status==="loading"?"not-allowed":"pointer",opacity:status==="loading"?.7:1,fontFamily:"var(--font)",boxShadow:"0 1px 6px rgba(0,0,0,.1)",transition:"box-shadow .15s"}}>
+          <svg width="20" height="20" viewBox="0 0 24 24">
+            <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+            <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+            <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+            <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+          </svg>
+          {status==="loading"?"Подождите...":"Войти через Google"}
+        </button>
+
+        <div style={{textAlign:"center",marginTop:20,paddingTop:16,borderTop:"1px solid var(--border)"}}>
+          <div style={{fontSize:11,color:"var(--t3)",marginBottom:8}}>Или продолжить без облака</div>
+          <button onClick={()=>onAuth(null)}
+            style={{background:"none",border:"1px solid var(--border)",borderRadius:8,padding:"8px 18px",cursor:"pointer",fontSize:12,color:"var(--t2)",fontFamily:"var(--font)"}}>
+            Работать локально
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SyncBadge({status}){
+  const c={synced:"var(--green)",syncing:"var(--amber)",offline:"var(--t3)",error:"var(--red)"}[status]||"var(--t3)";
+  const l={synced:"Сохранено",syncing:"Сохранение...",offline:"Локально",error:"Ошибка"}[status]||"";
+  return(
+    <div style={{display:"flex",alignItems:"center",gap:5,fontSize:11,color:c}}>
+      <div className={status==="syncing"?"pulse-dot":""} style={{width:6,height:6,borderRadius:"50%",background:c,flexShrink:0}}/>
+      {l}
+    </div>
+  );
+}
+
+/* ── QUICK LOG MODAL ───────────────────────────────────────── */
+function QuickLogModal({store,onClose}){
+  const{lessonLog,setLessonLog,students,quickLog}=store;
+  const[form,setForm]=useState({date:quickLog?.date||today()});
+  const st=students.find(s=>sameId(s.id,quickLog?.studentId));
+  function save(){
+    if(!form.topic||!form.topic.trim()){alert("Укажите тему урока");return;}
+    setLessonLog(prev=>[...(Array.isArray(prev)?prev:[]),{...form,topic:form.topic.trim(),studentId:quickLog.studentId,id:Date.now()}]);
+    onClose();
+  }
+  return(
+    <Modal title={`Журнал урока — ${st?.name||"ученик"}`} onClose={onClose}>
+      <div style={{background:"#EEF2FF",borderRadius:10,padding:"10px 14px",marginBottom:14,fontSize:12,color:T.accent,fontWeight:500}}>
+        📚 {st?.subject} · {fmtD(form.date)}
+      </div>
+      <Field label="Тема урока" required>
+        <Inp value={form.topic} onChange={v=>setForm(p=>({...p,topic:v}))} placeholder="Например: Законы Ньютона"/>
+      </Field>
+      <Field label="Что получилось">
+        <Txa value={form.result} onChange={v=>setForm(p=>({...p,result:v}))} rows={2} placeholder="Разобрали теорию, решили 5 задач..."/>
+      </Field>
+      <Field label="Домашнее задание">
+        <Inp value={form.homework} onChange={v=>setForm(p=>({...p,homework:v}))} placeholder="Задачи 12-15 из сборника"/>
+      </Field>
+      <Field label="Следующий шаг">
+        <Inp value={form.nextStep} onChange={v=>setForm(p=>({...p,nextStep:v}))} placeholder="Перейти к электричеству"/>
+      </Field>
+      <SaveRow onClose={onClose} onSave={save}/>
+    </Modal>
+  );
+}
+
+/* ──────────────────────────────────────────────────────────────
+   ВСЕ СТРАНИЦЫ (Home, WeekView, CalPage, ...)
+   Скопированы из index (3) БЕЗ ИЗМЕНЕНИЙ.
+   Они используют компоненты, определённые выше.
+───────────────────────────────────────────────────────────── */
+
+/* ══════════════════════════════════════════════════════════════
+   HOME
+══════════════════════════════════════════════════════════════ */
+function Home({store,setTab}){
+  const { isMobile } = useDevice();
+  const{events,students,expenses,incomes,tasks,goals,rls,excs,payments,lessonLog,setQuickLog}=store;
+  const now=new Date(),t=today(),mStr=localYM(now);
+  const wDates=getWeek(0),wS=iso(wDates[0]),wE=iso(wDates[6]);
+  const recW=useMemo(()=>genRec(rls,excs,students,wS,wE),[rls,excs,students,wS,wE]);
+  const allW=[...events.filter(e=>e.date>=wS&&e.date<=wE),
+    ...recW.filter(r=>!events.some(e=>e.date===r.date&&e.time===r.time&&e.studentId===r.studentId))];
+  const mInc=incomes.filter(i=>i.date.startsWith(mStr)).reduce((s,i)=>s+(Number(i.amount)||0),0);
+  const mExp=expenses.filter(e=>e.date.startsWith(mStr)).reduce((s,e)=>s+(Number(e.amount)||0),0);
+  const pStr=localYM(new Date(now.getFullYear(),now.getMonth()-1,1));
+  const pInc=incomes.filter(i=>i.date.startsWith(pStr)).reduce((s,i)=>s+(Number(i.amount)||0),0);
+  const incTrend=pInc>0?{dir:mInc>=pInc?"↑":"↓",pct:Math.abs(Math.round((mInc-pInc)/pInc*100)),up:mInc>=pInc}:null;
+  const todayRec=genRec(rls,excs,students,t,t);
+  const todayEv=[...events.filter(e=>e.date===t),
+    ...todayRec.filter(r=>!events.some(e=>e.date===r.date&&e.time===r.time&&e.studentId===r.studentId))]
+    .sort((a,b)=>a.time>b.time?1:-1);
+  const nowStr=now.toTimeString().slice(0,5);
+  const currentEv=useMemo(()=>todayEv.find(ev=>{
+    try{const end=addMin(ev.time||"00:00",Number(ev.duration)||60);
+      return(ev.time?.slice(0,5)||"")<=nowStr&&nowStr<end;}catch{return false;}
+  }),[todayEv,nowStr]);
+  const nextEv=todayEv.find(e=>(e.time?.slice(0,5)||"")>nowStr);
+  const todayL=todayEv.filter(e=>e.type==="lesson");
+  const mLessDone=events.filter(e=>e.date.startsWith(mStr)&&e.type==="lesson"&&e.status==="done").length;
+  const pendPay=students.map(s=>{
+    const ch=events.filter(e=>sameId(e.studentId,s.id)&&e.date.startsWith(mStr)&&e.type==="lesson"&&e.status==="done").length*(Number(s.price)||0);
+    const pd=payments.filter(p=>sameId(p.studentId,s.id)&&p.date?.startsWith(mStr)&&p.status!=="cancelled").reduce((a,p)=>a+(Number(p.amount)||0),0);
+    return{s,left:Math.max(0,ch-pd)};
+  }).filter(x=>x.left>0);
+  const todayForecast=todayL.reduce((s,l)=>{const st=students.find(x=>x.id===l.studentId);return s+(Number(l.price||st?.price)||0);},0);
+  const overdueTasks=tasks.filter(t=>t.status!=="done"&&t.deadline&&t.deadline<today());
+  const activeTasks=tasks.filter(t=>t.status!=="done");
+  const greetHour=now.getHours();
+  const greet=greetHour<12?"Доброе утро":greetHour<18?"Добрый день":"Добрый вечер";
+  const MN2=["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"];
+
+  // "Что сделать сегодня"
+  const todayActions=[];
+  todayL.filter(e=>e.status==="planned").forEach(l=>{
+    const st=students.find(s=>s.id===l.studentId);
+    todayActions.push({icon:"📚",text:`Урок — ${st?.name||"ученик"} в ${l.time?.slice(0,5)}`,tab:"calendar"});
+  });
+  pendPay.slice(0, isMobile ? 2 : 3).forEach(({s,left})=>{
+    todayActions.push({icon:"💰",text:`Напомнить об оплате — ${s.name} (${fmtM(left)} ₽)`,tab:"payments"});
+  });
+  overdueTasks.slice(0, isMobile ? 1 : 2).forEach(t2=>{
+    todayActions.push({icon:"⚠️",text:`Просроченная задача: ${t2.title}`,tab:"tasks"});
+  });
+  const doneTodayNoLog=todayL.filter(l=>l.status==="done").filter(l=>{
+    return !(Array.isArray(lessonLog)?lessonLog:[]).some(j=>sameId(j.studentId,l.studentId)&&j.date===t);
+  });
+  doneTodayNoLog.slice(0, isMobile ? 1 : 3).forEach(l=>{
+    const st=students.find(s=>s.id===l.studentId);
+    todayActions.push({icon:"📔",text:`Заполнить журнал — ${st?.name||"ученик"}`,tab:"_quicklog",studentId:l.studentId,date:t});
+  });
+  if(todayActions.length===0&&todayL.length===0)
+    todayActions.push({icon:"✅",text:"Свободный день — всё под контролем",tab:"home"});
+
+  // Данные для недели
+  const weekDays = wDates.map(d => iso(d));
+  const dayLessons = weekDays.map(dk => {
+    const dayEv = allW.filter(e => e.date === dk).sort((a,b)=>a.time>b.time?1:-1);
+    return { date: dk, events: dayEv };
+  });
+
+  // Адаптивные отступы и размеры
+  const pad = isMobile ? 14 : 20;
+  const gap = isMobile ? 12 : 16;
+  const fontSizeTitle = isMobile ? 14 : 15;
+  const fontSizeCardTitle = isMobile ? 13 : 14;
+  const fontSizeSmall = isMobile ? 9 : 10;
+  const fontSizeMedium = isMobile ? 11 : 12;
+
+  return(
+    <div>
+      {/* Live lesson banner */}
+      {currentEv&&(
+        <div style={{background:"linear-gradient(135deg,#16A34A,#15803D)",borderRadius:12,padding: isMobile ? "10px 14px" : "12px 18px",marginBottom:16,color:"#fff",display:"flex",alignItems:"center",gap:12,boxShadow:"0 4px 20px rgba(22,163,74,0.28)"}}>
+          <div className="pulse-dot" style={{width: isMobile ? 7 : 9,height: isMobile ? 7 : 9,borderRadius:"50%",background:"rgba(255,255,255,0.9)",flexShrink:0}}/>
+          <div style={{flex:1}}>
+            <div style={{fontWeight:700,fontSize: isMobile ? 12 : 14}}>{students.find(s=>s.id===currentEv.studentId)?.name||currentEv.title} — идёт сейчас</div>
+            <div style={{fontSize: isMobile ? 10 : 12,opacity:0.8}}>{currentEv.time?.slice(0,5)} — {addMin(currentEv.time||"00:00",Number(currentEv.duration)||60)}</div>
+          </div>
+          <div style={{textAlign:"right",flexShrink:0}}>
+            <div style={{fontSize: isMobile ? 8 : 10,opacity:0.65}}>осталось</div>
+            <div style={{fontSize: isMobile ? 13 : 16,fontWeight:800}}>{(()=>{const[h,m]=addMin(currentEv.time||"00:00",Number(currentEv.duration)||60).split(":").map(Number);const[nh,nm]=nowStr.split(":").map(Number);return Math.max(0,(h*60+m)-(nh*60+nm))+" мин";})()}</div>
+          </div>
+        </div>
+      )}
+
+      {/* Hero greeting */}
+      <div style={{background:"linear-gradient(140deg,#1E1B4B 0%,#1D4ED8 55%,#7C3AED 100%)",borderRadius:16,padding: isMobile ? "16px 18px" : "24px 28px",marginBottom:16,color:"#fff",position:"relative",overflow:"hidden",boxShadow:"0 8px 32px rgba(29,78,216,0.22)"}}>
+        <div style={{position:"absolute",right:-50,top:-50,width:200,height:200,borderRadius:"50%",border:"1px solid rgba(255,255,255,0.06)",pointerEvents:"none"}}/>
+        <div style={{fontSize: isMobile ? 8 : 10,opacity:0.55,marginBottom:2,letterSpacing:"0.06em",fontWeight:600,textTransform:"uppercase"}}>{now.getDate()} {MN2[now.getMonth()]} · {["Воскресенье","Понедельник","Вторник","Среда","Четверг","Пятница","Суббота"][now.getDay()]}</div>
+        <div style={{fontSize: isMobile ? 20 : 24,fontWeight:800,marginBottom: isMobile ? 10 : 16,letterSpacing:"-0.04em"}}>{greet}</div>
+        <div style={{display:"grid",gridTemplateColumns:`repeat(${isMobile ? 2 : 4},1fr)`,gap: isMobile ? 6 : 0}}>
+          {[
+            {l:"Уроков сегодня",v:todayL.length,accent:todayL.length>0},
+            {l:"Прогноз дня",v:`${fmtM(todayForecast)} ₽`},
+            {l:"Следующий",v:nextEv?nextEv.time?.slice(0,5):"—"},
+            {l:"Долгов",v:pendPay.length,accent:pendPay.length>0},
+          ].slice(0, isMobile ? 2 : 4).map(({l,v,accent})=>(
+            <div key={l}>
+              <div style={{fontSize: isMobile ? 7 : 9,opacity:0.55,marginBottom:2,fontWeight:600,letterSpacing:"0.05em",textTransform:"uppercase"}}>{l}</div>
+              <div style={{fontSize: isMobile ? 16 : 20,fontWeight:800,letterSpacing:"-0.04em",color:accent?"#FCD34D":"#fff"}}>{v}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* What to do today */}
+      <div style={{marginBottom:16}}>
+        <Card style={{ padding: pad }}>
+          <div style={{fontWeight:700,fontSize: fontSizeTitle,marginBottom: isMobile ? 8 : 12,letterSpacing:"-0.02em",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <span>Что сделать сегодня</span>
+            <span style={{fontSize: isMobile ? 10 : 11,color:T.t3,fontWeight:400}}>{todayActions.length} пунктов</span>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap: isMobile ? 4 : 7}}>
+            {todayActions.slice(0, isMobile ? 5 : 10).map((a,i)=>(
+              <div key={i} onClick={()=>{if(a.tab==="_quicklog"){setQuickLog({studentId:a.studentId,date:a.date||today()});}else if(a.tab!=="home"){setTab(a.tab);}}}
+                style={{display:"flex",alignItems:"center",gap: isMobile ? 6 : 10,padding: isMobile ? "6px 8px" : "9px 12px",borderRadius: isMobile ? 6 : 9,background:T.surface2,cursor:a.tab!=="home"?"pointer":"default",border:`1px solid ${T.border}`,transition:"background 0.1s",fontSize: isMobile ? 11 : 13}}
+                onMouseEnter={e=>{if(a.tab!=="home")e.currentTarget.style.background="#E0E7FF";}}
+                onMouseLeave={e=>e.currentTarget.style.background=T.surface2}>
+                <span style={{fontSize: isMobile ? 13 : 16,flexShrink:0}}>{a.icon}</span>
+                <span style={{flex:1}}>{a.text}</span>
+                {a.tab!=="home"&&<span style={{fontSize: isMobile ? 9 : 11,color:T.t3}}>→</span>}
+              </div>
+            ))}
+          </div>
+        </Card>
+      </div>
+
+      {/* KPI row */}
+      <div style={{display:"grid",gridTemplateColumns:`repeat(${isMobile ? 2 : 4},1fr)`,gap: isMobile ? 8 : 12,marginBottom:16}}>
+        {[
+          {v:`${fmtM(mInc)} ₽`,l:"Доход месяца",c:T.accent2,bg:"#F3F0FF",tr:incTrend},
+          {v:`${fmtM(mInc-mExp)} ₽`,l:"Прибыль",c:mInc-mExp>=0?T.green:T.red,bg:mInc-mExp>=0?"#EDFBF3":"#FEF2F2"},
+          {v:mLessDone,l:"Уроков в месяце",c:T.accent,bg:"#EEF2FF"},
+          {v:activeTasks.length,l:"Активных задач",c:T.amber,bg:"#FFFBEB",alert:overdueTasks.length>0},
+        ].slice(0, isMobile ? 2 : 4).map((c,i)=>(
+          <div key={c.l} className="anim-fade-up" style={{background:c.bg,borderRadius: isMobile ? 10 : 12,padding: isMobile ? "10px 12px" : "14px 16px",border:`1px solid ${T.border}`,boxShadow:T.shadow,animationDelay:`${i*0.05}s`}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:2}}>
+              <div style={{fontSize: isMobile ? 17 : 22,fontWeight:800,color:c.c,letterSpacing:"-0.04em"}}>{c.v}</div>
+              {c.tr&&<span style={{fontSize: isMobile ? 9 : 11,fontWeight:700,color:c.tr.up?T.green:T.red}}>{c.tr.dir}{c.tr.pct}%</span>}
+              {c.alert&&overdueTasks.length>0&&<span style={{fontSize: isMobile ? 9 : 11,fontWeight:700,color:T.red}}>!{overdueTasks.length}</span>}
+            </div>
+            <div style={{fontSize: isMobile ? 9 : 11,color:T.t2,fontWeight:500}}>{c.l}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Двухколоночная сетка — адаптивная */}
+      <div style={{
+        display:"grid",
+        gridTemplateColumns: isMobile ? "1fr" : "1fr 2fr",
+        gap: isMobile ? 12 : 16
+      }}>
+        {/* Левая колонка — Моя неделя */}
+        <Card style={{ padding: pad }}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom: isMobile ? 10 : 14}}>
+            <div style={{fontWeight:700,fontSize: fontSizeTitle,letterSpacing:"-0.02em"}}>Моя неделя</div>
+            <Btn variant="ghost" size="sm" onClick={()=>setTab("week")}>Подробнее →</Btn>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap: isMobile ? 4 : 6}}>
+            {weekDays.map((dk,idx)=>{
+              const dayData = dayLessons.find(d => d.date === dk);
+              const dayEv = dayData ? dayData.events : [];
+              const isToday = dk === t;
+              return(
+                <div key={dk} onClick={()=>setTab("week")} style={{
+                  cursor:"pointer",
+                  display:"flex",
+                  alignItems:"center",
+                  gap: isMobile ? 6 : 10,
+                  padding: isMobile ? "4px 6px" : "6px 8px",
+                  borderRadius:8,
+                  background:isToday?`${T.accent}10`:"transparent",
+                  border:isToday?`1px solid ${T.accent}30`:"none"
+                }}>
+                  <div style={{minWidth: isMobile ? 28 : 32}}>
+                    <div style={{fontSize: isMobile ? 9 : 10, fontWeight:700, color:isToday?T.accent:T.t3, textTransform:"uppercase", letterSpacing:"0.04em"}}>{DS[idx]}</div>
+                    <div style={{fontSize: isMobile ? 12 : 13, fontWeight:700, color:isToday?T.accent:T.text}}>{wDates[idx].getDate()}</div>
+                  </div>
+                  <div style={{flex:1, display:"flex", flexWrap:"wrap", gap: isMobile ? 2 : 3}}>
+                    {dayEv.length===0
+                      ?<span style={{fontSize: isMobile ? 10 : 11, color:T.t3, fontStyle:"italic"}}>Свободно</span>
+                      :dayEv.slice(0, isMobile ? 2 : 3).map(ev=>{
+                        const st=students.find(s=>s.id===ev.studentId);
+                        return(
+                          <span key={ev.id} style={{fontSize: isMobile ? 9 : 10, background:`${evc(ev.type)}20`, color:evc(ev.type), padding:"1px 4px", borderRadius:4, whiteSpace:"nowrap"}}>
+                            {ev.time?.slice(0,5)} {st?.name||ev.title}
+                          </span>
+                        );
+                      })
+                    }
+                    {dayEv.length > (isMobile ? 2 : 3) && <span style={{fontSize: isMobile ? 9 : 10, color:T.t3}}>+{dayEv.length - (isMobile ? 2 : 3)}</span>}
+                  </div>
+                  {dayEv.length>0 && <span style={{fontSize: isMobile ? 9 : 10, fontWeight:700, color:T.t2}}>{dayEv.length}</span>}
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+
+        {/* Правая колонка — три карточки */}
+        <div style={{display:"flex", flexDirection:"column", gap: isMobile ? 12 : 16}}>
+          {/* Сегодня */}
+          <Card style={{ padding: pad }}>
+            <div style={{fontWeight:700,fontSize: fontSizeCardTitle, marginBottom: isMobile ? 8 : 12, display:"flex", justifyContent:"space-between", alignItems:"center"}}>
+              <span>Сегодня</span>
+              <span style={{fontSize: isMobile ? 10 : 11, background:"#EEF2FF", color:T.accent, borderRadius:99, padding:"1px 8px", fontWeight:600}}>{todayL.length} уроков</span>
+            </div>
+            {todayEv.length===0
+              ?<div style={{textAlign:"center", padding: isMobile ? "4px 0" : "8px 0", color:T.t3, fontSize: isMobile ? 12 : 13}}>Свободный день 🎉</div>
+              :todayEv.slice(0, isMobile ? 3 : 4).map(ev=>{
+                const st=students.find(s=>s.id===ev.studentId);
+                const isNow=ev===currentEv;
+                return(
+                  <div key={ev.id} onClick={()=>setTab("calendar")} style={{display:"flex", alignItems:"center", gap: isMobile ? 6 : 8, padding: isMobile ? "4px 0" : "5px 0", borderBottom:`1px solid ${T.border2}`, cursor:"pointer"}}>
+                    <div style={{width: isMobile ? 2 : 2.5, height: isMobile ? 20 : 24, borderRadius:99, background:isNow?T.green:evc(ev.type), flexShrink:0}}/>
+                    <div style={{flex:1, minWidth:0}}>
+                      <div style={{fontWeight:600, fontSize: fontSizeMedium, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>{ev.title||st?.name||"Событие"}</div>
+                      <div style={{fontSize: fontSizeSmall, color:T.t3}}>{ev.time?.slice(0,5)}{isNow&&" · сейчас"}</div>
+                    </div>
+                    {ev.type==="lesson"&&<div style={{fontSize: fontSizeSmall, fontWeight:700, color:T.t2, flexShrink:0}}>{fmtM(ev.price||st?.price)} ₽</div>}
+                  </div>
+                );
+              })
+            }
+            <div style={{marginTop: isMobile ? 6 : 8}}><Btn variant="ghost" size="sm" onClick={()=>setTab("calendar")}>Открыть →</Btn></div>
+          </Card>
+
+          {/* Ожидают оплаты */}
+          <Card style={{ padding: pad }}>
+            <div style={{fontWeight:700,fontSize: fontSizeCardTitle, marginBottom: isMobile ? 8 : 12, display:"flex", justifyContent:"space-between", alignItems:"center"}}>
+              <span>Ожидают оплаты</span>
+              {pendPay.length>0&&<span style={{fontSize: isMobile ? 10 : 11, background:"#FEF2F2", color:T.red, borderRadius:99, padding:"1px 8px", fontWeight:600}}>{pendPay.length}</span>}
+            </div>
+            {pendPay.length===0
+              ?<div style={{textAlign:"center", padding: isMobile ? "4px 0" : "8px 0", color:T.t3, fontSize: isMobile ? 12 : 13}}>Всё оплачено ✓</div>
+              :pendPay.slice(0, isMobile ? 3 : 4).map(({s,left})=>(
+                <div key={s.id} onClick={()=>setTab("payments")} style={{display:"flex", justifyContent:"space-between", alignItems:"center", padding: isMobile ? "4px 0" : "5px 0", borderBottom:`1px solid ${T.border2}`, cursor:"pointer"}}>
+                  <div>
+                    <div style={{fontWeight:600, fontSize: fontSizeMedium}}>{s.name}</div>
+                    <div style={{fontSize: fontSizeSmall, color:T.t3}}>{s.subject}</div>
+                  </div>
+                  <span style={{fontWeight:700, color:T.red, fontSize: isMobile ? 12 : 13}}>{fmtM(left)} ₽</span>
+                </div>
+              ))
+            }
+            <div style={{marginTop: isMobile ? 6 : 8}}><Btn variant="ghost" size="sm" onClick={()=>setTab("payments")}>К платежам →</Btn></div>
+          </Card>
+
+          {/* Задачи */}
+          <Card style={{ padding: pad }}>
+            <div style={{fontWeight:700,fontSize: fontSizeCardTitle, marginBottom: isMobile ? 8 : 12, display:"flex", justifyContent:"space-between", alignItems:"center"}}>
+              <span>Задачи</span>
+              {overdueTasks.length>0&&<span style={{fontSize: isMobile ? 10 : 11, background:"#FEF2F2", color:T.red, borderRadius:99, padding:"1px 8px", fontWeight:600}}>!{overdueTasks.length} просрочено</span>}
+            </div>
+            {activeTasks.length===0
+              ?<div style={{textAlign:"center", padding: isMobile ? "4px 0" : "8px 0", color:T.t3, fontSize: isMobile ? 12 : 13}}>Задач нет ✓</div>
+              :[...overdueTasks,...activeTasks.filter(t=>!overdueTasks.includes(t))].slice(0, isMobile ? 3 : 4).map(t2=>{
+                const od=overdueTasks.includes(t2);
+                return(
+                  <div key={t2.id} onClick={()=>setTab("tasks")} style={{display:"flex", alignItems:"center", gap: isMobile ? 6 : 8, padding: isMobile ? "4px 0" : "5px 0", borderBottom:`1px solid ${T.border2}`, cursor:"pointer"}}>
+                    <div style={{width: isMobile ? 5 : 6, height: isMobile ? 5 : 6, borderRadius:"50%", background:od?T.red:PRC[t2.priority]||T.t3, flexShrink:0}}/>
+                    <div style={{flex:1, minWidth:0}}>
+                      <div style={{fontSize: fontSizeMedium, fontWeight:500, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", color:od?T.red:T.text}}>{t2.title}</div>
+                      {t2.deadline&&<div style={{fontSize: fontSizeSmall, color:od?T.red:T.t3}}>{od?"просрочено · ":""}{fmtD(t2.deadline)}</div>}
+                    </div>
+                  </div>
+                );
+              })
+            }
+            <div style={{marginTop: isMobile ? 6 : 8}}><Btn variant="ghost" size="sm" onClick={()=>setTab("tasks")}>Все задачи →</Btn></div>
+          </Card>
+        </div>
+      </div>
+    </div>
+  );
+}
+/* ══════════════════════════════════════════════════════════════
+   WEEK VIEW
+══════════════════════════════════════════════════════════════ */
+function WeekView({store}){
+  const{events,students,incomes,tasks,rls,excs,goals}=store;
+  const[wo,setWo]=useState(0);
+  const dates=getWeek(wo),wS=iso(dates[0]),wE=iso(dates[6]);
+  const recEv=useMemo(()=>genRec(rls,excs,students,wS,wE),[rls,excs,students,wS,wE]);
+  const allEv=[...events.filter(e=>e.date>=wS&&e.date<=wE),
+    ...recEv.filter(r=>!events.some(e=>e.date===r.date&&e.time===r.time&&e.studentId===r.studentId))];
+  const lessons=allEv.filter(e=>e.type==="lesson");
+  const inc=incomes.filter(i=>i.date>=wS&&i.date<=wE).reduce((s,i)=>s+(Number(i.amount)||0),0);
+  const planInc=lessons.filter(e=>e.status==="planned").reduce((s,l)=>{
+    const st=students.find(x=>x.id===l.studentId);return s+(Number(l.price||st?.price)||0);
+  },0);
+  const hrs=lessons.reduce((s,l)=>s+(Number(l.duration)||60)/60,0);
+  const urgTasks=tasks.filter(t=>t.status!=="done"&&t.deadline&&t.deadline>=wS&&t.deadline<=wE).sort((a,b)=>a.deadline>b.deadline?1:-1);
+  const now=new Date(),mStr=localYM(now);
+  const mInc=incomes.filter(i=>i.date.startsWith(mStr)).reduce((s,i)=>s+(Number(i.amount)||0),0);
+  const mGoalInc=goals.find(g=>g.autoKey==="monthIncome");
+  const toGoal=mGoalInc?Math.max(0,Number(mGoalInc.target)-mInc):null;
+  const avgPrice=students.length?students.reduce((s,x)=>s+(Number(x.price)||0),0)/students.length:1;
+
+  return(
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+        <div>
+          <div style={{fontSize:22,fontWeight:800,letterSpacing:"-0.04em"}}>Моя неделя</div>
+          <div style={{fontSize:12,color:T.t3,marginTop:2}}>
+            {dates[0].toLocaleDateString("ru-RU",{day:"numeric",month:"long"})} — {dates[6].toLocaleDateString("ru-RU",{day:"numeric",month:"long"})}
+          </div>
+        </div>
+        <div style={{display:"flex",gap:6}}>
+          <Btn variant="secondary" size="sm" onClick={()=>setWo(o=>o-1)}>←</Btn>
+          <Btn variant="secondary" size="sm" onClick={()=>setWo(0)}>Текущая</Btn>
+          <Btn variant="secondary" size="sm" onClick={()=>setWo(o=>o+1)}>→</Btn>
+        </div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+        <Card pad={0} style={{overflow:"hidden"}}>
+          <div style={{padding:"14px 18px",borderBottom:`1px solid ${T.border}`,fontWeight:700,fontSize:14,letterSpacing:"-0.02em"}}>Расписание недели</div>
+          {dates.map((d,di)=>{
+            const dk=iso(d),isT=dk===today();
+            const dayEv=allEv.filter(e=>e.date===dk).sort((a,b)=>a.time>b.time?1:-1);
+            return(
+              <div key={dk} style={{
+                padding:"10px 18px",
+                borderBottom:di<6?`1px solid ${T.border2}`:"none",
+                background:isT?T.surface2:"transparent"
+              }}>
+                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:3}}>
+                  <span style={{fontSize:11,fontWeight:700,color:isT?T.accent:T.t3,width:24,flexShrink:0}}>{DS[di]}</span>
+                  <span style={{fontSize:11,color:T.t3}}>{d.getDate()} {MR[d.getMonth()]}</span>
+                  {dayEv.length>0&&<Badge color={T.accent} size="sm">{dayEv.length}</Badge>}
+                  {isT&&<Badge color={T.green} size="sm" dot>Сег</Badge>}
+                </div>
+                {dayEv.length===0
+                  ?<div style={{fontSize:10,color:T.t3,marginLeft:32,fontStyle:"italic"}}>Свободно</div>
+                  :dayEv.slice(0,3).map(ev=>{
+                    const st=students.find(s=>s.id===ev.studentId);
+                    return(
+                      <div key={ev.id} style={{display:"flex",alignItems:"center",gap:5,marginLeft:32,marginBottom:2}}>
+                        <span style={{width:4,height:4,borderRadius:"50%",background:evc(ev.type),display:"inline-block",flexShrink:0}}/>
+                        <span style={{fontSize:11,color:T.text}}>{ev.time?.slice(0,5)}</span>
+                        <span style={{fontSize:11,color:T.t2}}>{ev.title||st?.name}</span>
+                        {st?.grade&&<span style={{fontSize:9,color:T.t3}}>{st.grade} кл</span>}
+                      </div>
+                    );
+                  })
+                }
+              </div>
+            );
+          })}
+        </Card>
+
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            {[
+              {v:`${fmtM(inc)} ₽`,l:"Доход (факт)",c:T.green,bg:"#EDFBF3"},
+              {v:`+${fmtM(planInc)} ₽`,l:"Прогноз",c:T.accent,bg:"#EEF2FF"},
+              {v:lessons.length,l:"Уроков",c:T.accent2,bg:"#F3F0FF"},
+              {v:`${hrs.toFixed(1)} ч`,l:"Часов",c:T.amber,bg:"#FFFBEB"},
+            ].map(x=>(
+              <div key={x.l} style={{background:x.bg,borderRadius:12,padding:14,border:`1px solid ${T.border}`}}>
+                <div style={{fontSize:18,fontWeight:800,color:x.c,letterSpacing:"-0.04em"}}>{x.v}</div>
+                <div style={{fontSize:10,color:T.t2,marginTop:2,fontWeight:500}}>{x.l}</div>
+              </div>
+            ))}
+          </div>
+
+          <Card pad={14}>
+            <div style={{fontSize:12,fontWeight:700,marginBottom:10,letterSpacing:"-0.02em"}}>Нагрузка дней</div>
+            <div style={{display:"flex",gap:5,alignItems:"flex-end",height:56}}>
+              {dates.map((d,di)=>{
+                const dk=iso(d),cnt=allEv.filter(e=>e.date===dk).length;
+                const mx=Math.max(...dates.map(x=>allEv.filter(e=>e.date===iso(x)).length),1);
+                const isT=dk===today();
+                return(
+                  <div key={dk} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+                    {cnt>0&&<div style={{fontSize:9,color:T.t2,fontWeight:700}}>{cnt}</div>}
+                    <div style={{width:"100%",background:isT?T.accent:T.accent2,borderRadius:"3px 3px 0 0",
+                      height:`${Math.max(3,(cnt/mx)*40)}px`,opacity:isT?1:0.5,transition:"height 0.3s"}}/>
+                    <div style={{fontSize:9,color:T.t3,fontWeight:500}}>{DS[di]}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </Card>
+
+          {toGoal!==null&&(
+            <Card pad={14} style={{background:"linear-gradient(135deg,#EEF2FF,#E8E0FF)"}}>
+              <div style={{fontSize:11,color:T.t2,marginBottom:2,fontWeight:500}}>До цели месяца</div>
+              <div style={{fontSize:20,fontWeight:800,color:T.accent,letterSpacing:"-0.04em"}}>{fmtM(toGoal)} ₽</div>
+              <div style={{fontSize:11,color:T.t2,marginTop:1,marginBottom:8}}>≈ {Math.ceil(toGoal/Math.max(avgPrice,1))} уроков</div>
+              <PBar cur={mInc} goal={Number(mGoalInc.target)||1} color={T.accent}/>
+            </Card>
+          )}
+
+          {urgTasks.length>0&&(
+            <Card pad={14}>
+              <div style={{fontSize:12,fontWeight:700,marginBottom:8,letterSpacing:"-0.02em"}}>Задачи недели</div>
+              {urgTasks.slice(0,4).map(t=>(
+                <div key={t.id} style={{display:"flex",alignItems:"center",gap:8,padding:"5px 0",borderBottom:`1px solid ${T.border2}`}}>
+                  <span style={{width:5,height:5,borderRadius:"50%",background:PRC[t.priority],display:"inline-block",flexShrink:0}}/>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:12,fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{t.title}</div>
+                    <div style={{fontSize:10,color:T.t3}}>до {fmtD(t.deadline)}</div>
+                  </div>
+                </div>
+              ))}
+            </Card>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   CALENDAR
+══════════════════════════════════════════════════════════════ */
+function CalPage({store,openNew,onOpenNew}){
+  const{events,setEvents,students,incomes,setIncomes,rls,excs,setExcs,autoComplete}=store;
+  const HOUR_H=useHourH();
+  const[view,setView]=useState("week");
+  const[wo,setWo]=useState(0);
+  const[mo,setMo]=useState(0);
+  const[modal,setModal]=useState(null);
+  const[form,setForm]=useState({});
+  const[mvForm,setMvForm]=useState(null);
+  const[dragId,setDragId]=useState(null);
+  const[hoverSlot,setHoverSlot]=useState(null);
+  const[sbw,setSbw]=useState(0);
+  const f=(k,v)=>setForm(p=>({...p,[k]:v}));
+  const dates=getWeek(wo);
+  const t=today(),now=new Date();
+  const mD=new Date(now.getFullYear(),now.getMonth()+mo,1);
+  const mY=mD.getFullYear(),mMo=mD.getMonth();
+
+  // Скачать расписание текущей недели как PDF (через печать браузера).
+  function exportWeekPDF(){
+    const wS=iso(dates[0]),wE=iso(dates[6]);
+    const rec=genRec(rls,excs,students,wS,wE);
+    const evs=[...events.filter(e=>e.type==="lesson"&&e.date>=wS&&e.date<=wE&&e.status!=="cancelled"),
+      ...rec.filter(r=>!events.some(e=>e.date===r.date&&e.time===r.time&&sameId(e.studentId,r.studentId)))];
+    const esc=s=>String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    const DSf=["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"];
+    const cols=dates.map((d,i)=>{
+      const dk=iso(d);
+      const dayEv=evs.filter(e=>e.date===dk).sort((a,b)=>(a.time||"").localeCompare(b.time||""));
+      const cells=dayEv.map(e=>{
+        const st=students.find(s=>sameId(s.id,e.studentId));
+        const end=addMin(e.time||"00:00",Number(e.duration)||60);
+        const nm=esc(e.title||st?.name||"Урок");
+        const sub=st?.subject?`<div class="sub">${esc(st.subject)}${st.grade?" · "+esc(st.grade)+" кл":""}</div>`:"";
+        return `<div class="ev"><div class="tm">${(e.time||"").slice(0,5)}–${end}</div><div class="nm">${nm}</div>${sub}</div>`;
+      }).join("")||'<div class="empty">—</div>';
+      const dt=d.getDate()+"."+String(d.getMonth()+1).padStart(2,"0");
+      const isT=dk===today();
+      return `<td class="col${isT?" today":""}"><div class="ch">${DSf[i]}<span>${dt}</span></div>${cells}</td>`;
+    }).join("");
+    const rangeLabel=dates[0].toLocaleDateString("ru-RU",{day:"numeric",month:"long"})+" — "+dates[6].toLocaleDateString("ru-RU",{day:"numeric",month:"long",year:"numeric"});
+    const total=evs.length;
+    const html=`<html><head><meta charset=utf-8><title>Расписание недели</title>
+      <style>
+      @page{size:A4 landscape;margin:12mm}
+      *{box-sizing:border-box}
+      body{font-family:-apple-system,Segoe UI,Arial,sans-serif;color:#18181b;margin:0}
+      h1{font-size:18px;margin:0 0 2px}
+      .sub0{color:#777;font-size:12px;margin-bottom:12px}
+      table{width:100%;border-collapse:collapse;table-layout:fixed}
+      td.col{vertical-align:top;border:1px solid #e5e5e5;padding:0;width:14.28%}
+      .ch{background:#1f2937;color:#fff;font-size:11px;font-weight:700;padding:6px;text-align:center;text-transform:uppercase;letter-spacing:.03em}
+      .ch span{display:block;font-size:13px;margin-top:1px;letter-spacing:0}
+      td.today .ch{background:#2C5EE8}
+      .ev{border-bottom:1px solid #eee;padding:6px 7px}
+      .ev .tm{font-size:10px;color:#2C5EE8;font-weight:700}
+      .ev .nm{font-size:12px;font-weight:600;margin-top:1px}
+      .ev .sub{font-size:10px;color:#888;margin-top:1px}
+      .empty{color:#ccc;text-align:center;padding:14px 0;font-size:12px}
+      .foot{margin-top:10px;color:#999;font-size:10px}
+      </style></head><body>
+      <h1>Расписание недели</h1>
+      <div class="sub0">${rangeLabel} · уроков: ${total}</div>
+      <table><tr>${cols}</tr></table>
+      <div class="foot">FizMat HQ · сформировано ${new Date().toLocaleDateString("ru-RU")}</div>
+      </body></html>`;
+    const w=window.open("","_blank");
+    if(w){w.document.write(html);w.document.close();setTimeout(()=>{try{w.print();}catch(_){}},350);}
+    else alert("Разрешите всплывающие окна, чтобы скачать PDF расписания.");
+  }
+
+  useEffect(()=>{setHoverSlot(null);},[view,wo,mo]);
+  useEffect(()=>{autoComplete();},[wo,mo]);
+  useEffect(()=>{
+    if(openNew){setForm({date:t,time:"10:00",duration:60,type:"lesson",status:"planned"});setModal("new");onOpenNew();}
+  },[openNew]);
+
+  const recEv=useMemo(()=>{
+    if(view==="week"){const s=iso(dates[0]),e=iso(dates[6]);return genRec(rls,excs,students,s,e);}
+    const from=`${mY}-${String(mMo+1).padStart(2,"0")}-01`;
+    const to=`${mY}-${String(mMo+1).padStart(2,"0")}-${dim(mY,mMo)}`;
+    return genRec(rls,excs,students,from,to);
+  },[rls,excs,students,view,wo,mo]);
+
+  const allEv=useMemo(()=>{
+    const res=[...events];
+    recEv.forEach(r=>{if(!events.some(e=>e.date===r.date&&e.time===r.time&&e.studentId===r.studentId))res.push(r);});
+    return res;
+  },[events,recEv]);
+
+  function openEdit(ev){ev.isRecurring?(setForm({...ev,_rec:true}),setModal("rec")):(setForm({...ev}),setModal("edit"));}
+
+  function save(){
+    const ev={...form,id:form.id||Date.now()};delete ev._rec;
+    if(modal==="new")setEvents([...events,ev]);
+    else setEvents(events.map(e=>e.id===ev.id?ev:e));
+    setModal(null);
+  }
+  function del(){
+    if(form._rec){setExcs([...excs,{recurringId:form.recurringId,date:form.date}]);}
+    else{if(!window.confirm("Удалить событие?"))return;const _pe=events,_pi=incomes;setEvents(events.filter(e=>e.id!==form.id));setIncomes(incomes.filter(i=>i.eventId!==form.id));store.pushUndo("Событие",()=>{setEvents(_pe);setIncomes(_pi);});}
+    setModal(null);
+  }
+  function skip(){setExcs([...excs,{recurringId:form.recurringId,date:form.date}]);setModal(null);}
+  function startMove(){setMvForm({recurringId:form.recurringId,origDate:form.date,newDate:form.date,newTime:form.time,studentId:form.studentId,duration:form.duration});setModal("move");}
+  function confirmMove(){
+    setExcs([...excs,{recurringId:mvForm.recurringId,date:mvForm.origDate}]);
+    const st=students.find(s=>s.id===mvForm.studentId);
+    setEvents([...events,{id:Date.now(),type:"lesson",studentId:mvForm.studentId,title:st?.name||"Урок",date:mvForm.newDate,time:mvForm.newTime,duration:mvForm.duration,status:"planned"}]);
+    setModal(null);
+  }
+  function onDragStart(e,ev){e.stopPropagation();e.dataTransfer.setData("eid",String(ev.id));setDragId(ev.id);}
+  function onDragEnd(){setDragId(null);}
+  function handleDrop(e,dk){
+    e.preventDefault();const id=Number(e.dataTransfer.getData("eid"));if(!id)return;
+    const rect=e.currentTarget.getBoundingClientRect();
+    const y=e.clientY-rect.top;
+    const hour=Math.min(CAL_END-1,Math.max(CAL_START,Math.floor(y/HOUR_H)+CAL_START));
+    setEvents(events.map(x=>x.id===id?{...x,date:dk,time:`${String(hour).padStart(2,"0")}:00`}:x));
+    setDragId(null);setHoverSlot(null);
+  }
+  function handleMouseMove(e,di){
+    const rect=e.currentTarget.getBoundingClientRect();
+    const y=e.clientY-rect.top;
+    const hour=Math.min(CAL_END-1,Math.max(CAL_START,Math.floor(y/HOUR_H)+CAL_START));
+    if(!hoverSlot||hoverSlot.di!==di||hoverSlot.hour!==hour)setHoverSlot({di,hour});
+  }
+  function handleColClick(e,dk){
+    if(e.target.dataset.ev)return;
+    const rect=e.currentTarget.getBoundingClientRect();
+    const y=e.clientY-rect.top;
+    const hour=Math.min(CAL_END-1,Math.max(CAL_START,Math.floor(y/HOUR_H)+CAL_START));
+    setForm({date:dk,time:`${String(hour).padStart(2,"0")}:00`,duration:60,type:"lesson",status:"planned"});
+    setModal("new");
+  }
+
+  const nowH=now.getHours(),nowMin=now.getMinutes();
+  const nowY=(nowH-CAL_START)*HOUR_H+(nowMin/60)*HOUR_H;
+  const showNow=nowH>=CAL_START&&nowH<CAL_END;
+  const totalH=CAL_HOURS.length*HOUR_H;
+  const scrollRef=useRef(null);
+  useEffect(()=>{
+    if(scrollRef.current&&view==="week"){
+      const target=Math.max(0,nowY-120);
+      scrollRef.current.scrollTop=target;
+    }
+  },[view,wo]);
+
+  // Ширина вертикального скроллбара сетки — резервируем её в шапке дней,
+  // иначе при появлении скроллбара колонки «съезжают» относительно заголовков.
+  useEffect(()=>{
+    const measure=()=>{const el=scrollRef.current; if(el) setSbw(Math.max(0,el.offsetWidth-el.clientWidth));};
+    measure();
+    const id=setTimeout(measure,60);
+    window.addEventListener("resize",measure);
+    return()=>{clearTimeout(id);window.removeEventListener("resize",measure);};
+  },[view,wo,mo]);
+
+  function MonthGrid(){
+    const fd=fdm(mY,mMo),days=dim(mY,mMo);
+    const cells=[];for(let i=0;i<fd;i++)cells.push(null);for(let d=1;d<=days;d++)cells.push(d);
+    while(cells.length%7!==0)cells.push(null);
+    return(
+      <Card pad={0} style={{overflow:"hidden"}}>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)"}}>
+          {DS.map(d=>(
+            <div key={d} style={{textAlign:"center",padding:"10px 4px",fontSize:10,fontWeight:700,color:T.t3,
+              borderBottom:`1px solid ${T.border}`,textTransform:"uppercase",letterSpacing:"0.05em"}}>{d}</div>
+          ))}
+          {cells.map((d,i)=>{
+            if(!d)return<div key={`e${i}`} style={{minHeight:90,borderBottom:`1px solid ${T.border}`,background:T.surface2}}/>;
+            const dk=`${mY}-${String(mMo+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+            const dayEv=allEv.filter(e=>e.date===dk).sort((a,b)=>a.time>b.time?1:-1);
+            const isT=dk===t;
+            return(
+              <div key={dk}
+                onClick={()=>{setForm({date:dk,time:"10:00",duration:60,type:"lesson",status:"planned"});setModal("new");}}
+                className="cal-cell"
+                style={{
+                  minHeight:90,borderBottom:`1px solid ${T.border}`,
+                  borderRight:i%7!==6?`1px solid ${T.border}`:"none",
+                  padding:"6px 7px",cursor:"pointer",
+                  background:isT?`${T.accent}08`:T.surface
+                }}
+              >
+                <div style={{marginBottom:4}}>
+                  <span style={{
+                    fontSize:12,fontWeight:isT?700:400,
+                    background:isT?T.accent:"transparent",color:isT?"#fff":T.text,
+                    borderRadius:"50%",width:22,height:22,
+                    display:"inline-flex",alignItems:"center",justifyContent:"center"
+                  }}>{d}</span>
+                </div>
+                {dayEv.slice(0,3).map(ev=>{
+                  const st=students.find(s=>s.id===ev.studentId);
+                  const c=evc(ev.type);
+                  return(
+                    <div key={ev.id}
+                      onClick={e=>{e.stopPropagation();openEdit(ev);}}
+                      style={{
+                        background:ev.isRecurring?"transparent":c,
+                        border:ev.isRecurring?`1.5px dashed ${c}`:"none",
+                        color:ev.isRecurring?c:"#fff",
+                        borderRadius:5,padding:"2px 6px",fontSize:9,fontWeight:600,
+                        marginBottom:2,cursor:"pointer",overflow:"hidden",
+                        textOverflow:"ellipsis",whiteSpace:"nowrap",lineHeight:1.6
+                      }}
+                    >
+                      {ev.time?.slice(0,5)} {ev.title||st?.name}
+                      {st?.grade?` · ${st.grade}кл`:""}
+                    </div>
+                  );
+                })}
+                {dayEv.length>3&&<div style={{fontSize:9,color:T.t3}}>+{dayEv.length-3} ещё</div>}
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+    );
+  }
+
+  return(
+    <div style={{display:"flex",flexDirection:"column",height:"calc(100vh - 94px)"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexShrink:0}}>
+        <div style={{fontSize:22,fontWeight:800,letterSpacing:"-0.04em"}}>Календарь</div>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          <div style={{display:"flex",background:T.surface2,borderRadius:9,overflow:"hidden",border:`1px solid ${T.border}`}}>
+            {["week","month"].map(v=>(
+              <button key={v} onClick={()=>setView(v)}
+                style={{
+                  padding:"6px 16px",border:"none",cursor:"pointer",
+                  fontWeight:600,fontSize:12,fontFamily:"var(--font)",
+                  background:view===v?T.accent:"transparent",
+                  color:view===v?"#fff":T.t2,transition:"all 0.15s"
+                }}
+              >
+                {v==="week"?"Неделя":"Месяц"}
+              </button>
+            ))}
+          </div>
+          {view==="week"?(
+            <>
+              <Btn variant="secondary" size="sm" onClick={()=>setWo(o=>o-1)}>←</Btn>
+              <div style={{fontWeight:600,fontSize:12,minWidth:190,textAlign:"center",color:T.t2}}>
+                {dates[0].toLocaleDateString("ru-RU",{day:"numeric",month:"short"})} — {dates[6].toLocaleDateString("ru-RU",{day:"numeric",month:"short",year:"numeric"})}
+              </div>
+              <Btn variant="secondary" size="sm" onClick={()=>setWo(0)}>Сег</Btn>
+              <Btn variant="secondary" size="sm" onClick={()=>setWo(o=>o+1)}>→</Btn>
+              <Btn variant="secondary" size="sm" onClick={exportWeekPDF}>⤓ PDF</Btn>
+            </>
+          ):(
+            <>
+              <Btn variant="secondary" size="sm" onClick={()=>setMo(o=>o-1)}>←</Btn>
+              <div style={{fontWeight:600,fontSize:13,minWidth:120,textAlign:"center"}}>{MN[mMo]} {mY}</div>
+              <Btn variant="secondary" size="sm" onClick={()=>setMo(0)}>Сег</Btn>
+              <Btn variant="secondary" size="sm" onClick={()=>setMo(o=>o+1)}>→</Btn>
+            </>
+          )}
+          <Btn size="sm" onClick={()=>{setForm({date:t,time:"10:00",duration:60,type:"lesson",status:"planned"});setModal("new");}}>+ Событие</Btn>
+        </div>
+      </div>
+
+      {view==="week"?(
+        <div style={{flex:1,minHeight:0,borderRadius:16,border:`1px solid ${T.border}`,
+          background:T.surface,boxShadow:T.shadow,display:"flex",flexDirection:"column",overflow:"hidden"}}>
+          <div style={{display:"flex",borderBottom:`1px solid ${T.border}`,flexShrink:0,paddingRight:sbw}}>
+            <div style={{width:62,flexShrink:0,borderRight:`1px solid ${T.border}`,background:T.surface}}/>
+            {dates.map((d,i)=>{
+              const dk=iso(d),isT=dk===t;
+              const dayEv=allEv.filter(e=>e.date===dk);
+              const lessonCount=dayEv.filter(e=>e.type==="lesson").length;
+              return(
+                <div key={i} style={{flex:1,textAlign:"center",padding:"10px 3px",
+                  borderRight:i<6?`1px solid ${T.border}`:"none",
+                  background:isT?`${T.accent}06`:T.surface}}>
+                  <div style={{fontSize:9,color:T.t3,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:3}}>{DS[i]}</div>
+                  <div style={{
+                    fontSize:15,fontWeight:700,letterSpacing:"-0.03em",
+                    background:isT?T.accent:"transparent",color:isT?"#fff":T.text,
+                    borderRadius:"50%",width:28,height:28,
+                    display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 3px"
+                  }}>{d.getDate()}</div>
+                  {lessonCount>0&&<div style={{fontSize:9,color:T.t3,fontWeight:500}}>{lessonCount} ур</div>}
+                </div>
+              );
+            })}
+          </div>
+
+          <div ref={scrollRef} className="cal-scroll" style={{flex:1,display:"flex",minHeight:0,overflowY:"auto"}}>
+            <div style={{width:62,flexShrink:0,borderRight:`1px solid ${T.border}`,background:T.surface,position:"relative",height:totalH}}>
+              {CAL_HOURS.map((h,i)=>(
+                <div key={h} style={{
+                  position:"absolute",top:i*HOUR_H,left:0,right:0,height:HOUR_H,
+                  display:"flex",alignItems:"flex-start",justifyContent:"flex-end",
+                  paddingRight:7,paddingTop:2,fontSize:8.5,color:T.t3,fontWeight:600,
+                  letterSpacing:"-0.02em",borderTop:i>0?`1px solid ${T.border}`:"none",
+                  lineHeight:1.2,textAlign:"right"
+                }}>
+                  {h}:00–{h+1}:00
+                </div>
+              ))}
+            </div>
+
+            <div style={{flex:1,display:"flex",position:"relative"}}>
+              <div style={{position:"absolute",inset:0,pointerEvents:"none",zIndex:0}}>
+                {CAL_HOURS.map((_,i)=>(
+                  <Fragment key={i}>
+                    {i>0&&<div style={{position:"absolute",top:i*HOUR_H,left:0,right:0,borderTop:`1px solid rgba(0,0,0,0.04)`}}/>}
+                    <div style={{position:"absolute",top:i*HOUR_H+HOUR_H/2,left:0,right:0,borderTop:`1px dashed rgba(0,0,0,0.025)`}}/>
+                  </Fragment>
+                ))}
+              </div>
+
+              {showNow&&(
+                <div style={{position:"absolute",top:nowY,left:0,right:0,zIndex:6,pointerEvents:"none",display:"flex"}}>
+                  {dates.map((d,i)=>{
+                    const isT=iso(d)===t;
+                    return isT?(
+                      <div key={i} style={{flex:1,height:2,background:T.red,position:"relative",boxShadow:`0 0 8px ${T.red}60`}}>
+                        <div style={{position:"absolute",left:-4,top:-4,width:10,height:10,borderRadius:"50%",background:T.red,boxShadow:`0 0 8px ${T.red}80`}}/>
+                      </div>
+                    ):<div key={i} style={{flex:1}}/>;
+                  })}
+                </div>
+              )}
+
+              {dates.map((d,di)=>{
+                const dk=iso(d),isT=dk===t;
+                const dayEv=layoutEvents(allEv.filter(e=>e.date===dk));
+                return(
+                  <div key={di}
+                    style={{
+                      flex:1,position:"relative",height:totalH,
+                      borderRight:di<6?`1px solid ${T.border}`:"none",
+                      background:isT?`${T.accent}03`:"transparent",
+                      cursor:"crosshair"
+                    }}
+                    onMouseMove={e=>handleMouseMove(e,di)}
+                    onMouseLeave={()=>setHoverSlot(null)}
+                    onClick={e=>handleColClick(e,dk)}
+                    onDragOver={e=>e.preventDefault()}
+                    onDrop={e=>handleDrop(e,dk)}
+                  >
+                    {hoverSlot?.di===di&&(
+                      <div style={{
+                        position:"absolute",
+                        top:(hoverSlot.hour-CAL_START)*HOUR_H+1,
+                        left:2,right:2,height:HOUR_H-2,borderRadius:8,
+                        background:`${T.accent}08`,
+                        border:`1.5px dashed ${T.accent}40`,
+                        display:"flex",alignItems:"center",justifyContent:"center",gap:5,
+                        pointerEvents:"none",zIndex:1
+                      }}>
+                        <span style={{fontSize:18,color:T.accent,fontWeight:200}}>+</span>
+                        <span style={{fontSize:10,color:T.accent,fontWeight:700}}>{String(hoverSlot.hour).padStart(2,"0")}:00</span>
+                      </div>
+                    )}
+
+                    {dayEv.map(ev=>{
+                      const[eh,em]=(ev.time||"00:00").split(":").map(Number);
+                      const top=(eh-CAL_START)*HOUR_H+(em/60)*HOUR_H;
+                      const dur=Number(ev.duration)||60;
+                      const ht=Math.max(22,(dur/60)*HOUR_H)-2;
+                      const colW=1/ev._total;
+                      const c=evc(ev.type);
+                      const st=students.find(s=>s.id===ev.studentId);
+                      const tall=ht>30,vTall=ht>54,ultraTall=ht>80;
+                      const contactIcon=st?.contactType==="Telegram"?"TG":st?.contactType==="WhatsApp"?"WA":st?.contactType==="Телефон"?"☎":null;
+                      return(
+                        <div key={ev.id}
+                          data-ev="1"
+                          draggable={!ev.isRecurring}
+                          onDragStart={e=>{e.stopPropagation();if(!ev.isRecurring)onDragStart(e,ev);}}
+                          onDragEnd={onDragEnd}
+                          onClick={e=>{e.stopPropagation();openEdit(ev);}}
+                          className="cal-ev"
+                          style={{
+                            position:"absolute",top,
+                            left:`calc(${ev._col*colW*100}% + 2px)`,
+                            width:`calc(${colW*100}% - 4px)`,
+                            height:ht,zIndex:2,
+                            cursor:ev.isRecurring?"pointer":"grab",
+                            background:ev.isRecurring?"transparent":c,
+                            border:ev.isRecurring?`2px dashed ${c}`:ev.status==="done"?`none`:`1px solid ${c}cc`,
+                            borderRadius:8,padding:"3px 7px",overflow:"hidden",
+                            opacity:ev.status==="cancelled"?0.3:dragId===ev.id?0.5:1,
+                            boxShadow:ev.isRecurring?"none":`0 2px 8px ${c}30`,
+                            userSelect:"none"
+                          }}
+                        >
+                          <div style={{fontWeight:700,color:ev.isRecurring?c:"#fff",fontSize:10,lineHeight:1.3,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                            {ev.title||st?.name||"Событие"}
+                          </div>
+
+                          {tall&&(
+                            <div style={{color:ev.isRecurring?c+"99":"rgba(255,255,255,0.8)",fontSize:9,marginTop:1}}>
+                              {ev.time?.slice(0,5)} — {addMin(ev.time||"00:00",dur)}
+                            </div>
+                          )}
+
+                          {vTall&&st&&(
+                            <div style={{color:"rgba(255,255,255,0.75)",fontSize:9,marginTop:2,display:"flex",gap:4,alignItems:"center"}}>
+                              <span>{st.subject}</span>
+                              {st.grade&&<span>· {st.grade} кл</span>}
+                              {contactIcon&&<span style={{background:"rgba(255,255,255,0.15)",borderRadius:3,padding:"0 3px",fontSize:8}}>{contactIcon}</span>}
+                            </div>
+                          )}
+
+                          {ultraTall&&(
+                            <div style={{display:"flex",gap:4,marginTop:3,flexWrap:"wrap",alignItems:"center"}}>
+                              {(ev.price||st?.price)>0&&(
+                                <span style={{background:"rgba(255,255,255,0.15)",color:"#fff",borderRadius:4,padding:"1px 5px",fontSize:8,fontWeight:700}}>
+                                  {fmtM(ev.price||st?.price)} ₽
+                                </span>
+                              )}
+                              {ev.status&&ev.status!=="planned"&&(
+                                <span style={{background:"rgba(255,255,255,0.15)",color:"#fff",borderRadius:4,padding:"1px 5px",fontSize:8}}>
+                                  {EV_ST[ev.status]}
+                                </span>
+                              )}
+                            </div>
+                          )}
+
+                          {ev.isRecurring&&<span style={{position:"absolute",bottom:2,right:4,fontSize:8,opacity:0.5,color:c}}>↻</span>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      ):<MonthGrid/>}
+
+      {(modal==="new"||modal==="edit")&&(
+        <Modal title={modal==="new"?"Новое событие":"Редактировать событие"} onClose={()=>setModal(null)}>
+          <Field label="Название"><Inp value={form.title} onChange={v=>f("title",v)} placeholder="Название события"/></Field>
+          <Field label="Тип">
+            <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+              {ET.map(et=>(
+                <button key={et.v} onClick={()=>f("type",et.v)}
+                  style={{
+                    padding:"5px 13px",borderRadius:8,border:"none",cursor:"pointer",
+                    fontWeight:600,fontSize:12,fontFamily:"var(--font)",
+                    background:form.type===et.v?et.c:et.c+"18",
+                    color:form.type===et.v?"#fff":et.c,transition:"all 0.12s"
+                  }}
+                >{et.l}</button>
+              ))}
+            </div>
+          </Field>
+          {form.type==="lesson"&&(
+            <Field label="Ученик">
+              <Sel value={form.studentId} onChange={v=>f("studentId",Number(v))}
+                options={[{v:"",l:"— выбрать —"},...students.map(s=>({v:s.id,l:`${s.name} · ${s.subject}${s.grade?` ${s.grade}кл`:""}`}))]}/>
+            </Field>
+          )}
+          <G2>
+            <Field label="Дата"><Inp type="date" value={form.date} onChange={v=>f("date",v)}/></Field>
+            <Field label="Время"><Inp type="time" value={form.time?.slice(0,5)||""} onChange={v=>f("time",v)}/></Field>
+            <Field label="Длительность (мин)"><Inp type="number" value={form.duration} onChange={v=>f("duration",v)}/></Field>
+            <Field label="Статус"><Sel value={form.status} onChange={v=>f("status",v)} options={Object.entries(EV_ST).map(([v,l])=>({v,l}))}/></Field>
+          </G2>
+          {form.duration>0&&form.time&&(
+            <div style={{marginBottom:14,padding:"8px 12px",background:T.surface2,borderRadius:9,fontSize:12,color:T.t2,display:"flex",alignItems:"center",gap:8,border:`1px solid ${T.border}`}}>
+              {form.time?.slice(0,5)} — {addMin(form.time,Number(form.duration)||0)}
+              <span style={{color:T.t3,marginLeft:"auto"}}>({(Number(form.duration)/60).toFixed(1)} ч)</span>
+            </div>
+          )}
+          <Field label="Комментарий"><Txa value={form.comment} onChange={v=>f("comment",v)} placeholder="Заметка..." rows={2}/></Field>
+          <SaveRow onClose={()=>setModal(null)} onSave={save} onDelete={modal==="edit"?del:null}/>
+        </Modal>
+      )}
+      {modal==="rec"&&(
+        <Modal title="Повторяющийся урок" onClose={()=>setModal(null)}>
+          <div style={{marginBottom:16,padding:14,background:T.surface2,borderRadius:10,fontSize:13,border:`1px solid ${T.border}`}}>
+            <div style={{fontWeight:700,marginBottom:3}}>{form.title}</div>
+            <div style={{color:T.t2,fontSize:12}}>{form.date} · {form.time?.slice(0,5)} · {form.duration} мин</div>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            <Btn variant="secondary" onClick={skip}>Пропустить этот урок</Btn>
+            <Btn variant="secondary" onClick={startMove}>Перенести на другую дату</Btn>
+            <Btn variant="danger" onClick={del}>Удалить (добавить исключение)</Btn>
+          </div>
+          <div style={{display:"flex",justifyContent:"flex-end",marginTop:12}}>
+            <Btn variant="ghost" onClick={()=>setModal(null)}>Закрыть</Btn>
+          </div>
+        </Modal>
+      )}
+      {modal==="move"&&mvForm&&(
+        <Modal title="Перенести урок" onClose={()=>setModal(null)}>
+          <div style={{marginBottom:14,fontSize:13,color:T.t2}}>Исходная дата: <strong style={{color:T.text}}>{mvForm.origDate}</strong></div>
+          <G2>
+            <Field label="Новая дата"><Inp type="date" value={mvForm.newDate} onChange={v=>setMvForm(p=>({...p,newDate:v}))}/></Field>
+            <Field label="Новое время"><Inp type="time" value={mvForm.newTime?.slice(0,5)||""} onChange={v=>setMvForm(p=>({...p,newTime:v}))}/></Field>
+          </G2>
+          <div style={{display:"flex",gap:8,marginTop:14,justifyContent:"flex-end"}}>
+            <Btn variant="secondary" onClick={()=>setModal("rec")}>Назад</Btn>
+            <Btn onClick={confirmMove}>Перенести</Btn>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   RECURRING
+══════════════════════════════════════════════════════════════ */
+function RecurringPage({store}){
+  const{rls,setRls,students,excs,setExcs,events}=store;
+  const[modal,setModal]=useState(false);const[form,setForm]=useState({});
+  const f=(k,v)=>setForm(p=>({...p,[k]:v}));
+  function save(){
+    const rl={...form,id:form.id||Date.now(),active:form.active!==false,weekday:Number(form.weekday)||1,duration:Number(form.duration)||60,startDate:form.startDate?form.startDate:(form.id?undefined:today()),priceOverride:form.priceOverride!==""&&form.priceOverride!=null?Number(form.priceOverride):null};
+    if(!form.id){
+      const cs=[];const now=new Date(),end=new Date();end.setMonth(end.getMonth()+6);const cur=new Date(now);
+      while(cur<=end){const wd=cur.getDay()===0?7:cur.getDay();if(wd===rl.weekday){const dk=iso(cur);if(events.find(e=>e.type==="lesson"&&e.studentId===rl.studentId&&e.date===dk&&e.time===rl.time))cs.push(dk);}cur.setDate(cur.getDate()+1);}
+      if(cs.length>0&&!window.confirm(`Конфликты на ${cs.length} дат. Продолжить?`))return;
+    }
+    if(form.id)setRls(rls.map(r=>r.id===form.id?rl:r));else setRls([...rls,rl]);setModal(false);
+  }
+  function del(){if(!window.confirm("Удалить шаблон?"))return;const _p=rls;setRls(rls.filter(r=>r.id!==form.id));store.pushUndo("Шаблон",()=>setRls(_p));setModal(false);}
+  return(
+    <div>
+      <SH title="Расписание" sub="Повторяющиеся уроки каждую неделю">
+        <Btn variant="secondary" size="sm" onClick={()=>setRls(rls.map(r=>({...r,active:!rls.some(x=>x.active)})))}>
+          {rls.some(r=>r.active)?"Пауза всем":"Возобновить"}
+        </Btn>
+        <Btn onClick={()=>{setForm({weekday:1,time:"10:00",duration:60,active:true,startDate:today()});setModal(true);}}>+ Шаблон</Btn>
+      </SH>
+      {rls.length===0?<Empty text="Шаблонов нет" sub="Добавьте повторяющийся урок"/>:(
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:14}}>
+          {rls.map(r=>{
+            const st=students.find(s=>s.id===r.studentId);
+            const exc=excs.filter(e=>e.recurringId===r.id).length;
+            return(
+              <Card key={r.id} hover style={{opacity:r.active?1:0.55,cursor:"pointer"}} onClick={()=>{setForm({...r,priceOverride:r.priceOverride??""});setModal(true);}}>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:12}}>
+                  <div>
+                    <div style={{fontSize:14,fontWeight:700,letterSpacing:"-0.02em"}}>{st?.name||"Ученик"}</div>
+                    <div style={{fontSize:11,color:T.t3,marginTop:1}}>{st?.subject}{st?.grade?` · ${st.grade} кл`:""}</div>
+                  </div>
+                  <Badge color={r.active?T.green:"#9CA3AF"} size="sm" dot>{r.active?"Активно":"Пауза"}</Badge>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
+                  {[["День",DF[r.weekday-1]||""],["Время",r.time?.slice(0,5)],["Длит.",`${r.duration}м`],["Цена",`${fmtM(r.priceOverride??st?.price??0)} ₽`]].map(([l,v])=>(
+                    <div key={l} style={{background:T.surface2,borderRadius:8,padding:"6px 9px",border:`1px solid ${T.border}`}}>
+                      <div style={{fontSize:9,color:T.t3,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.04em"}}>{l}</div>
+                      <div style={{fontSize:11,fontWeight:700,marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{v}</div>
+                    </div>
+                  ))}
+                </div>
+                {exc>0&&<div style={{marginTop:8,fontSize:11,color:T.t3}}>Исключений: {exc}</div>}
+              </Card>
+            );
+          })}
+        </div>
+      )}
+      {modal&&(
+        <Modal title={form.id?"Редактировать шаблон":"Новый шаблон"} onClose={()=>setModal(false)}>
+          <Field label="Ученик"><Sel value={form.studentId} onChange={v=>f("studentId",Number(v))} options={[{v:"",l:"— выбрать —"},...students.map(s=>({v:s.id,l:`${s.name} · ${s.subject}`}))]}/></Field>
+          <G2>
+            <Field label="День недели"><Sel value={form.weekday} onChange={v=>f("weekday",Number(v))} options={DF.map((d,i)=>({v:i+1,l:d}))}/></Field>
+            <Field label="Время"><Inp type="time" value={form.time} onChange={v=>f("time",v)}/></Field>
+            <Field label="Длительность (мин)"><Inp type="number" value={form.duration} onChange={v=>f("duration",v)}/></Field>
+            <Field label="Переопределить цену (₽)"><Inp type="number" value={form.priceOverride} onChange={v=>f("priceOverride",v)} placeholder="Из карточки ученика"/></Field>
+          </G2>
+          <Field label="Начало (уроки идут с этой даты)"><Inp type="date" value={form.startDate||""} onChange={v=>f("startDate",v)}/></Field>
+          <Field label="Активно"><Toggle on={form.active!==false} onChange={v=>f("active",v)} label="Шаблон активен"/></Field>
+          <SaveRow onClose={()=>setModal(false)} onSave={save} onDelete={form.id?del:null}/>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   STUDENTS
+══════════════════════════════════════════════════════════════ */
+function StudentsPage({store}){
+  const{students,setStudents,events,payments,setPayments,incomes,setIncomes,rls,lessonLog,setLessonLog}=store;
+  const[modal,setModal]=useState(false);
+  const[form,setForm]=useState({});
+  const[view,setView]=useState(null);
+  const[di,setDi]=useState(null);const[oi,setOi]=useState(null);
+  const[report,setReport]=useState(null);
+  const[logModal,setLogModal]=useState(null);
+  const[logForm,setLogForm]=useState({});
+  const f=(k,v)=>setForm(p=>({...p,[k]:v}));
+  const mStr=localYM(new Date());
+
+  function save(){
+    if(!form.name||!form.name.trim()){alert("Введите имя ученика");return;}
+    const data={...form,name:form.name.trim(),price:Number(form.price)||0};
+    if(form.id)setStudents(students.map(s=>s.id===form.id?data:s));
+    else setStudents([...students,{...data,id:Date.now()}]);
+    setModal(false);
+  }
+  function del(){if(!window.confirm(`Удалить «${form.name}»?`))return;const _p=students;setStudents(students.filter(s=>s.id!==form.id));store.pushUndo("Ученик",()=>setStudents(_p));setModal(false);}
+  function writeOffDebt(student,debt){
+    if(debt<=0){alert("У ученика нет долга за текущий месяц");return;}
+    if(!window.confirm(`Списать долг «${student.name}» за текущий месяц?\n\nБудет отмечено ${fmtM(debt)} ₽ как оплачено.`))return;
+    const pid="p"+Date.now()+Math.floor(Math.random()*100000);
+    const pd=today();
+    setPayments(prev=>[...(Array.isArray(prev)?prev:[]),{id:pid,studentId:student.id,amount:debt,date:pd,status:"paid",note:"Списание долга"}]);
+    setIncomes(prev=>[...(Array.isArray(prev)?prev:[]),{id:"i"+pid,paymentId:pid,studentId:student.id,amount:debt,date:pd,type:"Оплата урока",note:student.name}]);
+    alert("✓ Долг "+fmtM(debt)+" ₽ списан");
+  }
+  function resetStudentPayments(student){
+    const sPays=payments.filter(p=>sameId(p.studentId,student.id));
+    if(sPays.length===0){alert("У ученика нет записей об оплате");return;}
+    if(!window.confirm(`Удалить ВСЕ ${sPays.length} записей об оплате «${student.name}»?\n\nЗаписи о доходах останутся в разделе Финансы.\n\nМожно отменить в течение 8 секунд.`))return;
+    const _pp=payments;
+    setPayments(prev=>(Array.isArray(prev)?prev:[]).filter(p=>!sameId(p.studentId,student.id)));
+    store.pushUndo("Платежи ученика",()=>setPayments(_pp));
+    alert("✓ История платежей «"+student.name+"» очищена");
+  }
+  function resetStudentPaymentsFull(student){
+    const sPays=payments.filter(p=>sameId(p.studentId,student.id));
+    const sInc=incomes.filter(i=>sameId(i.studentId,student.id));
+    if(sPays.length===0&&sInc.length===0){alert("У ученика нет финансовых записей");return;}
+    if(!window.confirm(`ПОЛНОСТЬЮ обнулить финансы «${student.name}»?\n\n• Удалится ${sPays.length} платежей\n• Удалится ${sInc.length} записей дохода (включая Финансы)\n\nМожно отменить в течение 8 секунд.`))return;
+    const _pp=payments,_pi=incomes;
+    setPayments(prev=>(Array.isArray(prev)?prev:[]).filter(p=>!sameId(p.studentId,student.id)));
+    setIncomes(prev=>(Array.isArray(prev)?prev:[]).filter(i=>!sameId(i.studentId,student.id)));
+    store.pushUndo("Финансы ученика",()=>{setPayments(_pp);setIncomes(_pi);});
+    alert("✓ Все финансы «"+student.name+"» обнулены");
+  }
+  function saveLog(){
+    if(!logForm.topic||!logForm.topic.trim()){alert("Укажите тему урока");return;}
+    const entry={...logForm,topic:logForm.topic.trim(),studentId:logModal.studentId,date:logForm.date||today()};
+    if(logForm.id)setLessonLog(lessonLog.map(l=>l.id===logForm.id?entry:l));
+    else setLessonLog([...(Array.isArray(lessonLog)?lessonLog:[]),{...entry,id:Date.now()}]);
+    setLogModal(null);setLogForm({});
+  }
+  function delLog(id){if(!window.confirm("Удалить запись?"))return;const _p=lessonLog;setLessonLog(lessonLog.filter(l=>l.id!==id));store.pushUndo("Запись",()=>setLessonLog(_p));}
+  function onDS(e,i){e.dataTransfer.effectAllowed="move";setDi(i);}
+  function onDO(e,i){e.preventDefault();setOi(i);}
+  function onDrop(e,i){e.preventDefault();if(di===null||di===i){setDi(null);setOi(null);return;}const a=[...students];const[m]=a.splice(di,1);a.splice(i,0,m);setStudents(a);setDi(null);setOi(null);}
+
+  const SC={"Физика":T.accent,"Математика":T.accent2,"Информатика":T.green,"Химия":T.amber,"Другое":T.t3};
+
+  if(view){
+    const s=students.find(x=>x.id===view);
+    if(!s)return null;
+    const sEv=events.filter(e=>sameId(e.studentId,s.id)&&e.type==="lesson");
+    const done=sEv.filter(e=>e.status==="done");
+    const totalInc=done.length*(Number(s.price)||0);
+    const hrs=done.reduce((a,e)=>a+(Number(e.duration)||60)/60,0);
+    const last=[...done].sort((a,b)=>a.date>b.date?-1:1)[0];
+    const next=sEv.filter(e=>e.date>=today()&&e.status==="planned").sort((a,b)=>a.date>b.date?1:-1)[0];
+    const mPaid=payments.filter(p=>sameId(p.studentId,s.id)&&p.date?.startsWith(mStr)&&p.status!=="cancelled").reduce((a,p)=>a+(Number(p.amount)||0),0);
+    const mDue=sEv.filter(e=>e.date.startsWith(mStr)&&e.status==="done").length*(Number(s.price)||0);
+    const mDebt=Math.max(0,mDue-mPaid);
+    const sc=SC[s.subject]||T.t3;
+    const months=Array.from({length:6},(_,i)=>{const d=new Date();d.setMonth(d.getMonth()-5+i);return localYM(d);});
+    const monthData=months.map(m=>({m:m.slice(5),cnt:done.filter(e=>e.date.startsWith(m)).length}));
+    const maxCnt=Math.max(...monthData.map(x=>x.cnt),1);
+
+    return(
+      <div>
+        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:20}}>
+          <Btn variant="secondary" size="sm" onClick={()=>setView(null)}>← Назад</Btn>
+          <div style={{flex:1}}>
+            <div style={{fontSize:22,fontWeight:800,letterSpacing:"-0.04em"}}>{s.name}</div>
+            <div style={{fontSize:12,color:T.t3}}>{s.subject}{s.grade?` · ${s.grade} кл`:""}{s.exam?` · ${s.exam}`:""}</div>
+          </div>
+          <Btn variant="secondary" size="sm" onClick={()=>setReport({student:s,monthOff:0})}>📄 Отчёт родителям</Btn>
+          <Btn variant="secondary" size="sm" onClick={()=>resetStudentPayments(s)}>🗑 Сбросить платежи</Btn>
+          <Btn variant="secondary" size="sm" onClick={()=>resetStudentPaymentsFull(s)}>⊘ Обнулить всё</Btn>
+          <Btn variant="secondary" size="sm" onClick={()=>{setForm(s);setModal(true);}}>Редактировать</Btn>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:16}}>
+          {[
+            {l:"Уроков проведено",v:done.length,c:T.accent,bg:"#EEF2FF"},
+            {l:"Часов занятий",v:hrs.toFixed(1),c:T.accent2,bg:"#F3F0FF"},
+            {l:"Всего заработано",v:`${fmtM(totalInc)} ₽`,c:T.green,bg:"#EDFBF3"},
+            {l:"Долг (месяц)",v:`${fmtM(mDebt)} ₽`,c:mDebt>0?T.red:T.green,bg:mDebt>0?"#FEF2F2":"#EDFBF3"},
+          ].map(x=>(
+            <div key={x.l} style={{background:x.bg,borderRadius:12,padding:"14px 16px",border:`1px solid ${T.border}`}}>
+              <div style={{fontSize:20,fontWeight:800,color:x.c,letterSpacing:"-0.04em"}}>{x.v}</div>
+              <div style={{fontSize:11,color:T.t2,marginTop:2}}>{x.l}</div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:14}}>
+          <Card>
+            <div style={{fontWeight:700,fontSize:14,marginBottom:14,letterSpacing:"-0.02em"}}>Уроки за 6 месяцев</div>
+            <div style={{display:"flex",gap:6,alignItems:"flex-end",height:72}}>
+              {monthData.map((m,i)=>(
+                <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:4}}>
+                  {m.cnt>0&&<div style={{fontSize:9,color:T.t2,fontWeight:700}}>{m.cnt}</div>}
+                  <div style={{width:"100%",background:sc,opacity:0.2+(m.cnt/maxCnt)*0.8,borderRadius:"3px 3px 0 0",height:m.cnt>0?`${(m.cnt/maxCnt)*52}px`:"3px",transition:"height .5s",minHeight:3}}/>
+                  <div style={{fontSize:9,color:T.t3}}>{m.m}</div>
+                </div>
+              ))}
+            </div>
+          </Card>
+
+          <Card>
+            <div style={{fontWeight:700,fontSize:14,marginBottom:12,letterSpacing:"-0.02em"}}>Информация</div>
+            {[
+              ["Предмет",s.subject],["Класс",s.grade||"—"],["Цена",`${fmtM(s.price)} ₽/ур`],
+              ["Оплата",s.payMethod||"—"],["Цель",s.goal||"—"],
+              ["Контакт",s.contact?(s.contactType?`${s.contactType}: ${s.contact}`:s.contact):"—"],
+            ].map(([l,v])=>v&&v!=="—"&&(
+              <div key={l} style={{display:"flex",justifyContent:"space-between",padding:"5px 0",borderBottom:`1px solid ${T.border2}`,fontSize:13}}>
+                <span style={{color:T.t3,fontWeight:500}}>{l}</span>
+                <span style={{fontWeight:600,textAlign:"right",maxWidth:"55%",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{v}</span>
+              </div>
+            ))}
+          </Card>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:14}}>
+          <Card style={{background:next?"#EEF2FF":T.surface}}>
+            <div style={{fontSize:11,color:T.t3,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:6}}>Следующий урок</div>
+            {next?(<>
+              <div style={{fontSize:17,fontWeight:800,color:T.accent}}>{fmtD(next.date)}</div>
+              <div style={{fontSize:13,color:T.t2,marginTop:2}}>{next.time?.slice(0,5)} · {next.duration||60} мин</div>
+            </>):<div style={{fontSize:14,color:T.t3}}>Не запланирован</div>}
+          </Card>
+          <Card style={{background:last?"#EDFBF3":T.surface}}>
+            <div style={{fontSize:11,color:T.t3,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:6}}>Последний урок</div>
+            {last?(<>
+              <div style={{fontSize:17,fontWeight:800,color:T.green}}>{fmtD(last.date)}</div>
+              <div style={{fontSize:13,color:T.t2,marginTop:2}}>{Math.floor((new Date()-new Date(last.date))/86400000)} дней назад</div>
+            </>):<div style={{fontSize:14,color:T.t3}}>Уроков ещё не было</div>}
+          </Card>
+        </div>
+
+        {mDebt>0&&(
+          <Card style={{background:"#FEF2F2",border:"1px solid rgba(220,38,38,0.15)",marginBottom:14}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div>
+                <div style={{fontSize:13,fontWeight:700,color:T.red}}>Долг за текущий месяц: {fmtM(mDebt)} ₽</div>
+                <div style={{fontSize:11,color:T.t3,marginTop:2}}>Отметить как оплаченный</div>
+              </div>
+              <Btn size="sm" onClick={()=>{writeOffDebt(s,mDebt);}}>Списать долг</Btn>
+            </div>
+          </Card>
+        )}
+
+        <Card style={{marginBottom:14}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+            <div style={{fontWeight:700,fontSize:14,letterSpacing:"-0.02em"}}>Журнал занятий</div>
+            <Btn size="sm" onClick={()=>{setLogForm({date:today()});setLogModal({studentId:s.id});}}>+ Запись</Btn>
+          </div>
+          {(()=>{
+            const logs=(Array.isArray(lessonLog)?lessonLog:[]).filter(l=>sameId(l.studentId,s.id)).sort((a,b)=>a.date>b.date?-1:1);
+            if(logs.length===0)return<div style={{fontSize:13,color:T.t3,padding:"8px 0"}}>Записей пока нет. После урока добавь тему, домашнее задание и заметки — за месяц соберётся полная история для отчёта родителям.</div>;
+            return logs.map(l=>(
+              <div key={l.id} style={{padding:"12px 0",borderBottom:`1px solid ${T.border2}`}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:6}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                    <span style={{fontSize:11,fontWeight:700,color:T.accent,background:"#EEF2FF",borderRadius:6,padding:"2px 8px"}}>{fmtD(l.date)}</span>
+                    <span style={{fontSize:14,fontWeight:700,letterSpacing:"-0.02em"}}>{l.topic}</span>
+                  </div>
+                  <div style={{display:"flex",gap:4}}>
+                    <button onClick={()=>{setLogForm(l);setLogModal({studentId:s.id,entry:l});}} style={{background:"none",border:`1px solid ${T.border}`,borderRadius:6,padding:"2px 7px",cursor:"pointer",fontSize:11,color:T.t3}}>✎</button>
+                    <button onClick={()=>delLog(l.id)} style={{background:"none",border:`1px solid ${T.border}`,borderRadius:6,padding:"2px 7px",cursor:"pointer",fontSize:11,color:T.t3}}>×</button>
+                  </div>
+                </div>
+                {l.result&&<div style={{fontSize:12,color:T.t2,marginBottom:3}}><span style={{color:T.green,fontWeight:600}}>✓ Что получилось:</span> {l.result}</div>}
+                {l.homework&&<div style={{fontSize:12,color:T.t2,marginBottom:3}}><span style={{color:T.accent,fontWeight:600}}>📝 Домашнее:</span> {l.homework}</div>}
+                {l.nextStep&&<div style={{fontSize:12,color:T.t2}}><span style={{color:T.amber,fontWeight:600}}>→ Дальше:</span> {l.nextStep}</div>}
+              </div>
+            ));
+          })()}
+        </Card>
+
+        {s.notes&&<Card><div style={{fontWeight:700,fontSize:14,marginBottom:8}}>Заметки</div><div style={{fontSize:13,color:T.t2,lineHeight:1.6}}>{s.notes}</div></Card>}
+
+        {report&&(()=>{
+          const s=report.student;
+          const rDate=new Date(new Date().getFullYear(),new Date().getMonth()+report.monthOff,1);
+          const rStr=localYM(rDate);
+          const rLabel=`${MN[rDate.getMonth()]} ${rDate.getFullYear()}`;
+          const rEv=events.filter(e=>sameId(e.studentId,s.id)&&e.type==="lesson"&&e.date.startsWith(rStr));
+          const rDone=rEv.filter(e=>e.status==="done").sort((a,b)=>a.date>b.date?1:-1);
+          const rMissed=rEv.filter(e=>e.status==="missed").length;
+          const logTopics=(Array.isArray(lessonLog)?lessonLog:[]).filter(l=>sameId(l.studentId,s.id)&&l.date.startsWith(rStr)).map(l=>l.topic);
+          const evTopics=rDone.map(e=>e.comment||e.title).filter(t=>t&&t!==s.name);
+          const uniqTopics=[...new Set([...logTopics,...evTopics])];
+          const rHomework=(Array.isArray(lessonLog)?lessonLog:[]).filter(l=>sameId(l.studentId,s.id)&&l.date.startsWith(rStr)&&l.homework).map(l=>l.homework);
+          const rPaid=payments.filter(p=>sameId(p.studentId,s.id)&&p.date?.startsWith(rStr)&&p.status!=="cancelled").reduce((a,p)=>a+(Number(p.amount)||0),0);
+          const rDue=rDone.length*(Number(s.price)||0);
+          const hrs=rDone.reduce((a,e)=>a+(Number(e.duration)||60)/60,0);
+          const reportText="Отчёт по занятиям — "+rLabel+"\n\nУченик: "+s.name+(s.grade?", "+s.grade+" класс":"")+"\nПредмет: "+s.subject+(s.exam?" (подготовка к "+s.exam+")":"")+"\n\nПроведено занятий: "+rDone.length+"\nОбщее время: "+hrs.toFixed(1)+" ч"+(rMissed>0?"\nПропущено: "+rMissed:"")+(uniqTopics.length>0?"\n\nИзученные темы:\n"+uniqTopics.map(t=>"• "+t).join("\n"):"")+(rHomework&&rHomework.length>0?"\n\nДомашние задания:\n"+rHomework.map(h=>"• "+h).join("\n"):"")+"\n\nОплата за месяц: "+fmtM(rPaid)+" ₽"+(rDue>rPaid?" (ожидается ещё "+fmtM(rDue-rPaid)+" ₽)":" — полностью оплачено")+(s.goal?"\n\nЦель обучения: "+s.goal:"");
+          return(
+            <Modal title="Отчёт для родителей" onClose={()=>setReport(null)} wide>
+              <div style={{display:"flex",gap:8,marginBottom:16,alignItems:"center"}}>
+                <Btn variant="secondary" size="sm" onClick={()=>setReport({...report,monthOff:report.monthOff-1})}>←</Btn>
+                <div style={{flex:1,textAlign:"center",fontWeight:700,fontSize:14}}>{rLabel}</div>
+                <Btn variant="secondary" size="sm" onClick={()=>setReport({...report,monthOff:Math.min(0,report.monthOff+1)})}>→</Btn>
+              </div>
+              <div id="reportBody" style={{background:"#fff",borderRadius:14,padding:"24px 26px",border:"1px solid #E4E4E7",color:"#18181B"}}>
+                <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:18,paddingBottom:14,borderBottom:"2px solid #EEF2FF"}}>
+                  <div style={{width:36,height:36,background:"linear-gradient(135deg,#6366F1,#A855F7,#EC4899)",borderRadius:9,display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,fontWeight:900,color:"#fff"}}>F</div>
+                  <div>
+                    <div style={{fontSize:16,fontWeight:800,letterSpacing:"-0.03em",color:"#18181B"}}>Отчёт по занятиям</div>
+                    <div style={{fontSize:12,color:"#71717A"}}>{rLabel}</div>
+                  </div>
+                </div>
+                <div style={{marginBottom:16}}>
+                  <div style={{fontSize:18,fontWeight:800,color:"#18181B",letterSpacing:"-0.03em"}}>{s.name}</div>
+                  <div style={{fontSize:13,color:"#52525B",marginTop:2}}>{s.subject}{s.grade?" · "+s.grade+" класс":""}{s.exam?" · подготовка к "+s.exam:""}</div>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:18}}>
+                  {[["Занятий",rDone.length],["Часов",hrs.toFixed(1)],["Оплата",fmtM(rPaid)+" ₽"]].map(x=>(
+                    <div key={x[0]} style={{background:"#F4F4F5",borderRadius:10,padding:"12px 14px",textAlign:"center"}}>
+                      <div style={{fontSize:20,fontWeight:800,color:"#2563EB",letterSpacing:"-0.03em"}}>{x[1]}</div>
+                      <div style={{fontSize:10,color:"#71717A",marginTop:2,textTransform:"uppercase",letterSpacing:"0.04em",fontWeight:600}}>{x[0]}</div>
+                    </div>
+                  ))}
+                </div>
+                {uniqTopics.length>0&&(
+                  <div style={{marginBottom:16}}>
+                    <div style={{fontSize:13,fontWeight:700,color:"#18181B",marginBottom:8}}>Изученные темы</div>
+                    {uniqTopics.map((t,i)=>(
+                      <div key={i} style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",fontSize:13,color:"#3F3F46"}}>
+                        <span style={{color:"#16A34A",fontWeight:700}}>✓</span>{t}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {rHomework&&rHomework.length>0&&(
+                  <div style={{marginBottom:16}}>
+                    <div style={{fontSize:13,fontWeight:700,color:"#18181B",marginBottom:8}}>Домашние задания</div>
+                    {rHomework.map((h,i)=>(
+                      <div key={i} style={{display:"flex",alignItems:"flex-start",gap:8,padding:"4px 0",fontSize:13,color:"#3F3F46"}}>
+                        <span style={{color:"#2563EB",fontWeight:700}}>📝</span>{h}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {rDone.length>0&&(
+                  <div style={{marginBottom:16}}>
+                    <div style={{fontSize:13,fontWeight:700,color:"#18181B",marginBottom:8}}>Даты занятий</div>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                      {rDone.map(e=>(<span key={e.id} style={{background:"#EEF2FF",color:"#2563EB",borderRadius:7,fontSize:11,fontWeight:600,padding:"3px 9px"}}>{fmtD(e.date)}</span>))}
+                    </div>
+                  </div>
+                )}
+                <div style={{paddingTop:14,borderTop:"1px solid #E4E4E7",fontSize:13,color:"#52525B"}}>
+                  {rDue>rPaid?"Оплачено "+fmtM(rPaid)+" ₽ из "+fmtM(rDue)+" ₽. Ожидается доплата "+fmtM(rDue-rPaid)+" ₽.":"Оплата за месяц получена полностью — "+fmtM(rPaid)+" ₽."}
+                  {s.goal&&<div style={{marginTop:6}}><strong>Цель обучения:</strong> {s.goal}</div>}
+                </div>
+              </div>
+              {rDone.length===0&&<div style={{textAlign:"center",color:T.t3,fontSize:13,marginTop:14}}>За {rLabel} проведённых занятий нет</div>}
+              <div style={{display:"flex",gap:8,marginTop:16}}>
+                <Btn style={{flex:1}} onClick={()=>{navigator.clipboard.writeText(reportText).then(()=>alert("✓ Отчёт скопирован — вставьте в WhatsApp, Telegram или письмо"),()=>alert("Не удалось скопировать"));}}>📋 Копировать текст</Btn>
+                <Btn variant="secondary" style={{flex:1}} onClick={()=>{const w=window.open("","_blank");if(w){w.document.write("<html><head><title>Отчёт "+s.name+"</title><meta charset=utf-8></head><body style='font-family:sans-serif;max-width:600px;margin:30px auto;padding:20px'>"+document.getElementById("reportBody").innerHTML+"</body></html>");w.document.close();w.print();}}}>🖨 Печать / PDF</Btn>
+              </div>
+            </Modal>
+          );
+        })()}
+
+        {logModal&&(
+          <Modal title={logForm.id?"Редактировать запись":"Запись в журнал"} onClose={()=>{setLogModal(null);setLogForm({});}}>
+            <G2>
+              <Field label="Дата"><Inp type="date" value={logForm.date} onChange={v=>setLogForm(p=>({...p,date:v}))}/></Field>
+              <Field label="Тема урока" required><Inp value={logForm.topic} onChange={v=>setLogForm(p=>({...p,topic:v}))} placeholder="Импульс и энергия"/></Field>
+            </G2>
+            <Field label="Что получилось"><Txa value={logForm.result} onChange={v=>setLogForm(p=>({...p,result:v}))} rows={2} placeholder="Разобрали законы сохранения, решили 5 задач..."/></Field>
+            <Field label="Домашнее задание"><Txa value={logForm.homework} onChange={v=>setLogForm(p=>({...p,homework:v}))} rows={2} placeholder="№ 12-15 из сборника..."/></Field>
+            <Field label="Следующий шаг"><Inp value={logForm.nextStep} onChange={v=>setLogForm(p=>({...p,nextStep:v}))} placeholder="Перейти к электричеству"/></Field>
+            <SaveRow onClose={()=>{setLogModal(null);setLogForm({});}} onSave={saveLog} onDelete={logForm.id?()=>{delLog(logForm.id);setLogModal(null);setLogForm({});}:null}/>
+          </Modal>
+        )}
+      </div>
+    );
+  }
+
+  return(
+    <div>
+      <SH title="Ученики" sub="Нажмите на карточку для подробной информации">
+        <Btn onClick={()=>{setForm({subject:"Физика",payMethod:"В конце месяца",contactType:"Telegram"});setModal(true);}}>+ Добавить</Btn>
+      </SH>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:14}}>
+        {students.map((s,i)=>{
+          const done=events.filter(e=>sameId(e.studentId,s.id)&&e.status==="done"&&e.type==="lesson");
+          const totalInc=done.length*(Number(s.price)||0);
+          const last=[...done].sort((a,b)=>a.date>b.date?-1:1)[0];
+          const next=events.filter(e=>sameId(e.studentId,s.id)&&e.date>=today()&&e.type==="lesson").sort((a,b)=>a.date>b.date?1:-1)[0];
+          const tmpl=rls.filter(r=>sameId(r.studentId,s.id)&&r.active);
+          const mPaid=payments.filter(p=>sameId(p.studentId,s.id)&&p.date?.startsWith(mStr)&&p.status!=="cancelled").reduce((a,p)=>a+(Number(p.amount)||0),0);
+          const mDue=done.filter(e=>e.date.startsWith(mStr)).length*(Number(s.price)||0);
+          const mDebt=Math.max(0,mDue-mPaid);
+          const sc=SC[s.subject]||T.t3;
+          const warn=last&&Math.floor((new Date()-new Date(last.date))/86400000)>14&&!next;
+
+          return(
+            <div key={s.id} draggable onDragStart={e=>onDS(e,i)} onDragOver={e=>onDO(e,i)} onDrop={e=>onDrop(e,i)} onDragEnd={()=>{setDi(null);setOi(null);}} style={{opacity:di===i?0.5:1}}>
+              <div className="card-hover" onClick={()=>setView(s.id)} style={{
+                background:T.surface,borderRadius:14,padding:18,cursor:"pointer",
+                border:oi===i?`2px solid ${T.accent}`:`1px solid ${T.border}`,
+                boxShadow:T.shadow,position:"relative",overflow:"hidden"
+              }}>
+                <div style={{position:"absolute",top:0,left:0,right:0,height:3,background:sc}}/>
+
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10,marginTop:8}}>
+                  <div style={{minWidth:0,flex:1}}>
+                    <div style={{fontSize:15,fontWeight:700,letterSpacing:"-0.02em",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{s.name}</div>
+                    <div style={{fontSize:11,color:T.t3,marginTop:2}}>
+                      <span style={{color:sc,fontWeight:600}}>{s.subject}</span>
+                      {s.grade&&<span> · {s.grade} кл</span>}
+                      {s.exam&&<span> · {s.exam}</span>}
+                    </div>
+                  </div>
+                  <button onClick={e=>{e.stopPropagation();setForm(s);setModal(true);}} style={{background:"none",border:`1px solid ${T.border}`,borderRadius:7,padding:"3px 8px",cursor:"pointer",fontSize:11,color:T.t2,fontFamily:"var(--font)"}}>✎</button>
+                </div>
+
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:10}}>
+                  {[["Уроков",done.length],["₽/урок",fmtM(s.price)],["Часов",done.reduce((a,e)=>a+(Number(e.duration)||60)/60,0).toFixed(1)],["Доход",`${fmtM(totalInc)} ₽`]].map(([l,v])=>(
+                    <div key={l} style={{background:T.surface2,borderRadius:8,padding:"6px 8px",border:`1px solid ${T.border}`}}>
+                      <div style={{fontSize:9,color:T.t3,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.04em"}}>{l}</div>
+                      <div style={{fontSize:12,fontWeight:700,marginTop:2}}>{v}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {mDebt>0&&(
+                  <div style={{background:"#FEF2F2",borderRadius:7,padding:"5px 9px",marginBottom:8,fontSize:11,color:T.red,fontWeight:600,border:"1px solid rgba(220,38,38,0.12)"}}>
+                    💰 Долг за месяц: {fmtM(mDebt)} ₽
+                  </div>
+                )}
+
+                {warn&&(
+                  <div style={{background:"#FFFBEB",borderRadius:7,padding:"5px 9px",marginBottom:8,fontSize:11,color:T.amber,fontWeight:500,border:"1px solid rgba(217,119,6,0.12)"}}>
+                    ⚠️ Давно не было урока
+                  </div>
+                )}
+
+                {tmpl.length>0&&(
+                  <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:6}}>
+                    {tmpl.map(r=>(
+                      <span key={r.id} style={{background:`${T.accent}15`,color:T.accent,borderRadius:99,fontSize:10,fontWeight:600,padding:"2px 8px"}}>↺ {["Пн","Вт","Ср","Чт","Пт","Сб","Вс"][r.weekday-1]} {r.time?.slice(0,5)}</span>
+                    ))}
+                  </div>
+                )}
+
+                <div style={{fontSize:11,color:next?T.accent:T.t3,fontWeight:next?600:400}}>
+                  {next?`→ ${fmtD(next.date)} в ${next.time?.slice(0,5)}`:(last?`Последний: ${fmtD(last.date)}`:"Уроков ещё не было")}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+        {students.length===0&&<div style={{gridColumn:"1/-1"}}><div style={{textAlign:"center",padding:"40px 20px",color:T.t3}}><div style={{fontSize:40,marginBottom:12}}>👨‍🎓</div><div style={{fontSize:15,fontWeight:600,color:T.t2}}>Учеников пока нет</div><div style={{fontSize:13,marginTop:4}}>Добавьте первого ученика</div></div></div>}
+      </div>
+
+      {modal&&(
+        <Modal title={form.id?"Редактировать ученика":"Новый ученик"} onClose={()=>setModal(false)}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+            <Field label="Имя" required><Inp value={form.name} onChange={v=>f("name",v)} placeholder="Имя ученика"/></Field>
+            <Field label="Предмет"><Sel value={form.subject} onChange={v=>f("subject",v)} options={SUBJECTS}/></Field>
+            <Field label="Класс"><Inp value={form.grade} onChange={v=>f("grade",v)} placeholder="9"/></Field>
+            <Field label="Экзамен"><Inp value={form.exam} onChange={v=>f("exam",v)} placeholder="ОГЭ, ЕГЭ..."/></Field>
+            <Field label="Цена за урок (₽)"><Inp type="number" value={form.price} onChange={v=>f("price",v)}/></Field>
+            <Field label="Длительность (мин)"><Inp type="number" value={form.duration} onChange={v=>f("duration",v)} placeholder="60"/></Field>
+            <Field label="Оплата"><Sel value={form.payMethod} onChange={v=>f("payMethod",v)} options={PMETHODS}/></Field>
+            <Field label="Тип связи"><Sel value={form.contactType||"Telegram"} onChange={v=>f("contactType",v)} options={CONTACT_TYPES}/></Field>
+          </div>
+          <Field label="Контакт"><Inp value={form.contact} onChange={v=>f("contact",v)} placeholder="@username / телефон"/></Field>
+          <Field label="Цель обучения"><Inp value={form.goal} onChange={v=>f("goal",v)} placeholder="Подготовка к ЕГЭ..."/></Field>
+          <Field label="Заметки"><Txa value={form.notes} onChange={v=>f("notes",v)} rows={2} placeholder="Особенности, темы, замечания..."/></Field>
+          <SaveRow onClose={()=>setModal(false)} onSave={save} onDelete={form.id?del:null}/>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   FINANCE
+══════════════════════════════════════════════════════════════ */
+function FinancePage({store}){
+  const{expenses,setExpenses,incomes,setIncomes,expTpl,setExpTpl}=store;
+  const[tabF,setTabF]=useState("all");const[modal,setModal]=useState(null);const[form,setForm]=useState({});const[tplForm,setTplForm]=useState({});
+  const f=(k,v)=>setForm(p=>({...p,[k]:v}));
+  const now=new Date(),mStr=localYM(now);
+  const pStr=localYM(new Date(now.getFullYear(),now.getMonth()-1,1));
+  const mInc=incomes.filter(i=>i.date.startsWith(mStr)).reduce((s,i)=>s+(Number(i.amount)||0),0);
+  const pInc=incomes.filter(i=>i.date.startsWith(pStr)).reduce((s,i)=>s+(Number(i.amount)||0),0);
+  const mExp=expenses.filter(e=>e.date.startsWith(mStr)).reduce((s,e)=>s+(Number(e.amount)||0),0);
+  const pExp=expenses.filter(e=>e.date.startsWith(pStr)).reduce((s,e)=>s+(Number(e.amount)||0),0);
+  const trend=(c,p)=>{if(!p||p===0)return null;const pct=Math.abs(Math.round((c-p)/p*100));return{dir:c>=p?"↑":"↓",pct,up:c>=p};};
+  function saveE(){if(!form.amount||Number(form.amount)<=0){alert("Введите сумму больше нуля");return;}const data={...form,amount:Number(form.amount)};if(form.id)setExpenses(expenses.map(e=>e.id===form.id?data:e));else setExpenses([...expenses,{...data,id:Date.now()}]);setModal(null);}
+  function saveI(){if(!form.amount||Number(form.amount)<=0){alert("Введите сумму больше нуля");return;}const data={...form,amount:Number(form.amount)};if(form.id)setIncomes(incomes.map(i=>i.id===form.id?data:i));else setIncomes([...incomes,{...data,id:Date.now()}]);setModal(null);}
+  function addFromTpl(t){
+    const e={id:Date.now()+Math.floor(Math.random()*1000),amount:Number(t.amount),date:today(),category:t.category||"Прочее",comment:t.name};
+    setExpenses(prev=>[...(Array.isArray(prev)?prev:[]),e]);
+  }
+  function saveTpl(){
+    if(!tplForm.name||!tplForm.name.trim()){alert("Введите название шаблона");return;}
+    if(!tplForm.amount||Number(tplForm.amount)<=0){alert("Введите сумму больше нуля");return;}
+    const t={...tplForm,name:tplForm.name.trim(),amount:Number(tplForm.amount)};
+    if(tplForm.id)setExpTpl(expTpl.map(x=>x.id===tplForm.id?t:x));
+    else setExpTpl([...(Array.isArray(expTpl)?expTpl:[]),{...t,id:Date.now()}]);
+    setModal(null);setTplForm({});
+  }
+  function delTpl(id){const _p=expTpl;setExpTpl(expTpl.filter(x=>x.id!==id));store.pushUndo("Шаблон",()=>setExpTpl(_p));}
+  const months=Array.from({length:6},(_,i)=>{const d=new Date();d.setMonth(d.getMonth()-i);return localYM(d);}).reverse();
+
+  const CAT_COLORS=["#2C5EE8","#7C3AED","#2A9D5C","#C47C00","#D63A3A","#5B5BD6","#636366"];
+  const catData=ECATS.map((c,i)=>({name:c,value:expenses.filter(e=>e.category===c).reduce((s,e)=>s+(Number(e.amount)||0),0),color:CAT_COLORS[i%CAT_COLORS.length]})).filter(x=>x.value>0);
+  const totalExp=catData.reduce((s,x)=>s+x.value,0)||1;
+
+  const monthlyData=months.map(m=>{
+    const inc=incomes.filter(i=>i.date.startsWith(m)).reduce((s,i)=>s+(Number(i.amount)||0),0);
+    const exp=expenses.filter(e=>e.date.startsWith(m)).reduce((s,e)=>s+(Number(e.amount)||0),0);
+    return{m,inc,exp,v:inc};
+  });
+
+  return(
+    <div>
+      <SH title="Финансы">
+        <Btn variant="secondary" size="sm" onClick={()=>{setForm({date:today(),type:"Подработка"});setModal("inc");}}>+ Доход</Btn>
+        <Btn size="sm" onClick={()=>{setForm({date:today(),category:ECATS[0]});setModal("exp");}}>+ Расход</Btn>
+      </SH>
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:14,marginBottom:20}}>
+        {[
+          {l:"Доход за месяц",v:mInc,p:pInc,c:T.green,bg:"#EDFBF3",inv:false},
+          {l:"Расходы за месяц",v:mExp,p:pExp,c:T.red,bg:"#FEF2F2",inv:true},
+          {l:"Прибыль",v:mInc-mExp,p:pInc-pExp,c:T.accent,bg:"#EEF2FF",inv:false}
+        ].map(x=>{
+          const tr=trend(x.v,x.p);
+          const trC=x.inv?(tr?.up?T.red:T.green):(tr?.up?T.green:T.red);
+          return(
+            <div key={x.l} style={{background:x.bg,borderRadius:16,padding:"20px 22px",border:`1px solid ${T.border}`,boxShadow:T.shadow}}>
+              <div style={{fontSize:26,fontWeight:800,color:x.c,letterSpacing:"-0.04em",marginBottom:4}}>{fmtM(x.v)} ₽</div>
+              <div style={{fontSize:12,color:T.t2,display:"flex",alignItems:"center",gap:8}}>
+                <span>{x.l}</span>
+                {tr&&<span style={{fontWeight:700,color:trC,fontSize:11}}>{tr.dir}{tr.pct}%</span>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{background:T.surface,borderRadius:14,padding:"16px 18px",marginBottom:20,border:`1px solid ${T.border}`,boxShadow:T.shadow}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+          <div>
+            <div style={{fontSize:14,fontWeight:700,letterSpacing:"-0.02em"}}>Быстрые расходы</div>
+            <div style={{fontSize:11,color:T.t3,marginTop:1}}>Нажми на шаблон — расход добавится мгновенно</div>
+          </div>
+          <Btn variant="secondary" size="sm" onClick={()=>{setTplForm({category:ECATS[0]});setModal("tpl");}}>+ Шаблон</Btn>
+        </div>
+        {(!expTpl||expTpl.length===0)
+          ?<div style={{fontSize:12,color:T.t3,padding:"8px 0"}}>Шаблонов пока нет. Создай «Аренда 5000», «Реклама 2000» и добавляй расходы одним кликом.</div>
+          :<div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+            {expTpl.map(t=>(
+              <div key={t.id} style={{display:"flex",alignItems:"center",gap:0,borderRadius:9,overflow:"hidden",border:`1px solid ${T.border}`}}>
+                <button onClick={()=>addFromTpl(t)} style={{background:T.surface2,border:"none",padding:"8px 12px",cursor:"pointer",fontFamily:"var(--font)",textAlign:"left"}}
+                  onMouseEnter={e=>e.currentTarget.style.background="#EEF2FF"}
+                  onMouseLeave={e=>e.currentTarget.style.background=T.surface2}>
+                  <div style={{fontSize:12,fontWeight:600,color:T.tx}}>{t.name}</div>
+                  <div style={{fontSize:11,color:T.red,fontWeight:700}}>−{fmtM(t.amount)} ₽</div>
+                </button>
+                <button onClick={()=>{setTplForm(t);setModal("tpl");}} style={{background:T.surface2,border:"none",borderLeft:`1px solid ${T.border}`,padding:"0 8px",cursor:"pointer",color:T.t3,fontSize:11,alignSelf:"stretch"}}>✎</button>
+              </div>
+            ))}
+          </div>
+        }
+      </div>
+
+      <div style={{display:"flex",gap:8,marginBottom:16}}>
+        {[["all","Всё"],["inc","Доходы"],["exp","Расходы"],["chart","Графики"]].map(([v,l])=>(
+          <Btn key={v} size="sm" variant={tabF===v?"primary":"secondary"} onClick={()=>setTabF(v)}>{l}</Btn>
+        ))}
+      </div>
+
+      {tabF==="chart"?(
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+          <Card>
+            <div style={{fontSize:14,fontWeight:700,marginBottom:16,letterSpacing:"-0.02em"}}>Динамика дохода</div>
+            <LineChart data={monthlyData} height={130} color={T.accent} valueKey="inc" labelKey="m"/>
+          </Card>
+
+          <Card>
+            <div style={{fontSize:14,fontWeight:700,marginBottom:16,letterSpacing:"-0.02em"}}>Расходы по категориям</div>
+            {catData.length===0?<Empty text="Нет данных"/>:(
+              <div style={{display:"flex",gap:20,alignItems:"center"}}>
+                <DonutChart
+                  segments={catData}
+                  size={130} stroke={14}
+                  label={`${fmtM(totalExp)}`}
+                  sublabel="₽ всего"
+                />
+                <div style={{flex:1}}>
+                  {catData.map(cat=>(
+                    <div key={cat.name} style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+                      <div style={{width:8,height:8,borderRadius:2,background:cat.color,flexShrink:0}}/>
+                      <div style={{flex:1,fontSize:12,color:T.t2}}>{cat.name}</div>
+                      <div style={{fontSize:12,fontWeight:700,color:T.text}}>{Math.round(cat.value/totalExp*100)}%</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </Card>
+
+          <Card>
+            <div style={{fontSize:14,fontWeight:700,marginBottom:16,letterSpacing:"-0.02em"}}>Доход по месяцам</div>
+            <BarChart data={monthlyData} valueKey="inc" labelKey="m" color={T.accent} currency height={130}/>
+          </Card>
+
+          <Card>
+            <div style={{fontSize:14,fontWeight:700,marginBottom:16,letterSpacing:"-0.02em"}}>Доходы vs Расходы</div>
+            {mInc===0&&mExp===0?<Empty text="Нет данных за месяц"/>:(
+              <div style={{display:"flex",gap:24,alignItems:"center"}}>
+                <DonutChart
+                  segments={[
+                    {value:mInc,color:T.green},
+                    {value:mExp,color:T.red},
+                    {value:Math.max(0,mInc-mExp),color:T.accent}
+                  ]}
+                  size={130} stroke={14}
+                  label={mInc>mExp?"+":"−"}
+                  sublabel={`${fmtM(Math.abs(mInc-mExp))} ₽`}
+                />
+                <div style={{flex:1}}>
+                  {[["Доход",mInc,T.green],["Расходы",mExp,T.red],["Прибыль",mInc-mExp,T.accent]].map(([l,v,c])=>(
+                    <div key={l} style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                      <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                        <div style={{width:8,height:8,borderRadius:2,background:c}}/>
+                        <span style={{fontSize:12,color:T.t2}}>{l}</span>
+                      </div>
+                      <span style={{fontSize:13,fontWeight:700,color:c}}>{fmtM(v)} ₽</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </Card>
+        </div>
+      ):(
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+          {(tabF==="all"||tabF==="inc")&&(
+            <Card>
+              <div style={{fontSize:14,fontWeight:700,marginBottom:14,letterSpacing:"-0.02em"}}>Доходы</div>
+              {incomes.filter(i=>i.date.startsWith(mStr)).length===0?<Empty text="Нет данных"/>:(
+                incomes.filter(i=>i.date.startsWith(mStr)).sort((a,b)=>a.date>b.date?-1:1).slice(0,15).map(i=>(
+                  <div key={i.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:`1px solid ${T.border2}`,fontSize:12}}>
+                    <div style={{minWidth:0,flex:1}}>
+                      <span style={{color:T.t3}}>{fmtD(i.date)}</span>
+                      <span style={{margin:"0 6px"}}>·</span>
+                      <Badge color={T.accent2} size="sm">{i.type}</Badge>
+                      {i.note&&<span style={{color:T.t2,marginLeft:6}}>{i.note}</span>}
+                    </div>
+                    <div style={{display:"flex",gap:6,alignItems:"center",marginLeft:10,flexShrink:0}}>
+                      <span style={{fontWeight:700,color:T.green}}>+{fmtM(i.amount)} ₽</span>
+                      {!i.eventId&&(
+                        <button onClick={()=>{const _p=incomes;setIncomes(incomes.filter(x=>x.id!==i.id));store.pushUndo("Доход",()=>setIncomes(_p));}}
+                          style={{background:"none",border:"none",cursor:"pointer",color:T.t3,fontSize:14,lineHeight:1,padding:"2px"}}>×</button>
+                      )}
+                    </div>
+                  </div>
+                ))
+              )}
+            </Card>
+          )}
+          {(tabF==="all"||tabF==="exp")&&(
+            <Card>
+              <div style={{fontSize:14,fontWeight:700,marginBottom:14,letterSpacing:"-0.02em"}}>Расходы</div>
+              {expenses.length===0?<Empty text="Нет расходов"/>:(
+                expenses.sort((a,b)=>a.date>b.date?-1:1).slice(0,15).map(e=>(
+                  <div key={e.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:`1px solid ${T.border2}`,fontSize:12}}>
+                    <div style={{minWidth:0,flex:1}}>
+                      <span style={{color:T.t3}}>{fmtD(e.date)}</span>
+                      <span style={{margin:"0 6px"}}>·</span>
+                      <Badge color={T.accent2} size="sm">{e.category}</Badge>
+                      {e.comment&&<div style={{fontSize:10,color:T.t3,marginTop:2}}>{e.comment}</div>}
+                    </div>
+                    <div style={{display:"flex",gap:6,alignItems:"center",marginLeft:10,flexShrink:0}}>
+                      <span style={{fontWeight:700,color:T.red}}>-{fmtM(e.amount)} ₽</span>
+                      <button onClick={()=>{const _p=expenses;setExpenses(expenses.filter(x=>x.id!==e.id));store.pushUndo("Расход",()=>setExpenses(_p));}}
+                        style={{background:"none",border:"none",cursor:"pointer",color:T.t3,fontSize:14,lineHeight:1,padding:"2px"}}>×</button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </Card>
+          )}
+        </div>
+      )}
+
+      {modal==="exp"&&(
+        <Modal title="Новый расход" onClose={()=>setModal(null)}>
+          <G2>
+            <Field label="Сумма (₽)"><Inp type="number" value={form.amount} onChange={v=>f("amount",v)}/></Field>
+            <Field label="Дата"><Inp type="date" value={form.date} onChange={v=>f("date",v)}/></Field>
+          </G2>
+          <Field label="Категория"><Sel value={form.category} onChange={v=>f("category",v)} options={ECATS}/></Field>
+          <Field label="Комментарий"><Inp value={form.comment} onChange={v=>f("comment",v)} placeholder="Описание..."/></Field>
+          <SaveRow onClose={()=>setModal(null)} onSave={saveE}/>
+        </Modal>
+      )}
+
+      {modal==="tpl"&&(
+        <Modal title={tplForm.id?"Редактировать шаблон":"Новый шаблон расхода"} onClose={()=>{setModal(null);setTplForm({});}}>
+          <Field label="Название" required><Inp value={tplForm.name} onChange={v=>setTplForm(p=>({...p,name:v}))} placeholder="Аренда кабинета"/></Field>
+          <G2>
+            <Field label="Сумма (₽)" required><Inp type="number" value={tplForm.amount} onChange={v=>setTplForm(p=>({...p,amount:v}))}/></Field>
+            <Field label="Категория"><Sel value={tplForm.category} onChange={v=>setTplForm(p=>({...p,category:v}))} options={ECATS}/></Field>
+          </G2>
+          <SaveRow onClose={()=>{setModal(null);setTplForm({});}} onSave={saveTpl} onDelete={tplForm.id?()=>{delTpl(tplForm.id);setModal(null);setTplForm({});}:null}/>
+        </Modal>
+      )}
+      {modal==="inc"&&(
+        <Modal title="Новый доход" onClose={()=>setModal(null)}>
+          <G2>
+            <Field label="Сумма (₽)"><Inp type="number" value={form.amount} onChange={v=>f("amount",v)}/></Field>
+            <Field label="Дата"><Inp type="date" value={form.date} onChange={v=>f("date",v)}/></Field>
+          </G2>
+          <Field label="Тип"><Sel value={form.type} onChange={v=>f("type",v)} options={["Урок","Подработка","Продажа материалов","Прочее"]}/></Field>
+          <Field label="Заметка"><Inp value={form.note} onChange={v=>f("note",v)} placeholder="Описание..."/></Field>
+          <SaveRow onClose={()=>setModal(null)} onSave={saveI}/>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   PAYMENTS
+══════════════════════════════════════════════════════════════ */
+function PaymentsPage({store}){
+  const{students,events,payments,setPayments,setIncomes}=store;
+  const[modal,setModal]=useState(false);
+  const[histModal,setHistModal]=useState(null);
+  const[form,setForm]=useState({});
+  const[justPaid,setJustPaid]=useState(null);
+  const[onlyDebt,setOnlyDebt]=useState(false);
+  const f=(k,v)=>setForm(p=>({...p,[k]:v}));
+  const[monthOff,setMonthOff]=useState(0);
+  const now=new Date();
+  const mDate=new Date(now.getFullYear(),now.getMonth()+monthOff,1);
+  const mStr=localYM(mDate);
+  const mLabel=`${MN[mDate.getMonth()]} ${mDate.getFullYear()}`;
+
+  function save(){
+    if(!form.studentId){alert("Выберите ученика");return;}
+    if(!form.amount||Number(form.amount)<=0){alert("Введите сумму больше нуля");return;}
+    if(!form.date){alert("Укажите дату");return;}
+    const pid=form.id||Date.now();
+    const st=students.find(s=>s.id===form.studentId);
+    const p={...form,id:pid,amount:Number(form.amount),status:form.status||"paid"};
+    if(form.id){
+      setPayments(payments.map(x=>x.id===p.id?p:x));
+      setIncomes(prev=>prev.map(i=>i.paymentId===pid?{...i,amount:p.amount,date:p.date,note:st?st.name:""}:i));
+    } else {
+      setPayments(prev=>[...prev,p]);
+      setIncomes(prev=>[...prev,{id:"i"+Date.now()+Math.random(),paymentId:pid,amount:p.amount,date:p.date,type:"Оплата урока",note:st?st.name:""}]);
+    }
+    setModal(false);
+    setForm({});
+  }
+  function quickPayFull(student, debtAmount){
+    try {
+      if(!debtAmount||debtAmount<=0)return;
+      const pid="p"+Date.now()+Math.floor(Math.random()*100000);
+      const payDate=monthOff===0?today():`${mStr}-15`;
+      const p={id:pid,studentId:student.id,amount:Number(debtAmount),date:payDate,status:"paid",note:"Полная оплата"};
+      setPayments(prev=>[...(Array.isArray(prev)?prev:[]),p]);
+      setIncomes(prev=>[...(Array.isArray(prev)?prev:[]),{id:"i"+pid,paymentId:pid,studentId:student.id,amount:Number(debtAmount),date:payDate,type:"Оплата урока",note:student.name}]);
+      setJustPaid(student.id);
+      setTimeout(()=>setJustPaid(null),2000);
+    } catch(err) {
+      alert("Ошибка при сохранении оплаты: "+err.message);
+    }
+  }
+
+  function resetMonthPayments(){
+    const monthPays=payments.filter(p=>p.date?.startsWith(mStr));
+    if(monthPays.length===0){alert("За "+mLabel+" нет записей об оплате");return;}
+    if(!window.confirm("Удалить ВСЮ информацию об оплате за "+mLabel+"?\n\n• Удалится "+monthPays.length+" записей об оплате\n• Долги учеников обнулятся (расчёт начнётся заново)\n• Записи о доходах ОСТАНУТСЯ в разделе Финансы\n\nМожно отменить в течение 8 секунд.")) return;
+    const _pp=payments;
+    setPayments(prev=>(Array.isArray(prev)?prev:[]).filter(p=>!p.date?.startsWith(mStr)));
+    store.pushUndo("Оплаты за месяц",()=>setPayments(_pp));
+    alert("✓ Информация об оплате за "+mLabel+" очищена.\nИстория доходов сохранена в Финансах.");
+  }
+
+  function closeMonth(){
+    const debtors=students.map(s=>{
+      const ch=events.filter(e=>sameId(e.studentId,s.id)&&e.date.startsWith(mStr)&&e.type==="lesson"&&e.status==="done").length*(Number(s.price)||0);
+      const pd=payments.filter(p=>sameId(p.studentId,s.id)&&p.date?.startsWith(mStr)&&p.status!=="cancelled").reduce((a,p)=>a+(Number(p.amount)||0),0);
+      return{s,left:Math.max(0,ch-pd)};
+    }).filter(x=>x.left>0);
+
+    if(debtors.length===0){alert("За "+mLabel+" нет непогашенных долгов — всё уже оплачено ✓");return;}
+
+    const total=debtors.reduce((a,d)=>a+d.left,0);
+    if(!window.confirm("Закрыть "+mLabel+"?\n\nБудет отмечено как оплачено для "+debtors.length+" учеников на сумму "+fmtM(total)+" ₽.\n\nЭто создаст платежи на сумму долга каждого.")) return;
+
+    const payDate=monthOff===0?today():`${mStr}-15`;
+    const newPays=[], newIncs=[];
+    debtors.forEach(({s,left})=>{
+      const pid="p"+Date.now()+Math.floor(Math.random()*100000)+s.id;
+      newPays.push({id:pid,studentId:s.id,amount:left,date:payDate,status:"paid",note:"Закрытие месяца "+mLabel});
+      newIncs.push({id:"i"+pid,paymentId:pid,studentId:s.id,amount:left,date:payDate,type:"Оплата урока",note:s.name});
+    });
+    setPayments(prev=>[...(Array.isArray(prev)?prev:[]),...newPays]);
+    setIncomes(prev=>[...(Array.isArray(prev)?prev:[]),...newIncs]);
+    alert("✓ Месяц "+mLabel+" закрыт. Долги "+debtors.length+" учеников погашены ("+fmtM(total)+" ₽).");
+  }
+  function cancelPayment(pid){
+    if(!window.confirm("Отменить этот платёж? Доход также будет удалён."))return;
+    setPayments(payments.map(p=>p.id===pid?{...p,status:"cancelled"}:p));
+    setIncomes(prev=>prev.filter(i=>i.paymentId!==pid));
+  }
+  function deletePayment(pid){
+    if(!window.confirm("Удалить платёж безвозвратно?"))return;
+    const _pp=payments; let _ri=[];
+    setPayments(payments.filter(p=>p.id!==pid));
+    setIncomes(prev=>{const arr=Array.isArray(prev)?prev:[]; _ri=arr.filter(i=>i.paymentId===pid); return arr.filter(i=>i.paymentId!==pid);});
+    store.pushUndo("Платёж",()=>{setPayments(_pp);setIncomes(prev=>[...(Array.isArray(prev)?prev:[]),..._ri]);});
+  }
+
+  const totalCharged=students.reduce((s,st)=>{
+    return s+events.filter(e=>sameId(e.studentId,st.id)&&e.date.startsWith(mStr)&&e.type==="lesson"&&e.status==="done").length*(Number(st.price)||0);
+  },0);
+  const totalPaid=payments.filter(p=>p.date?.startsWith(mStr)&&p.status!=="cancelled").reduce((s,p)=>s+(Number(p.amount)||0),0);
+
+  return(
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:22}}>
+        <div>
+          <div style={{fontSize:22,fontWeight:800,letterSpacing:"-0.04em"}}>Платежи</div>
+          <div style={{fontSize:12,color:T.t3,marginTop:2}}>{mLabel}</div>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          <Btn variant="secondary" size="sm" onClick={()=>setMonthOff(o=>o-1)}>←</Btn>
+          <Btn variant="secondary" size="sm" onClick={()=>setMonthOff(0)}>Сейчас</Btn>
+          <Btn variant="secondary" size="sm" onClick={()=>setMonthOff(o=>o+1)}>→</Btn>
+          <Btn variant="secondary" size="sm" onClick={closeMonth}>✓ Закрыть месяц</Btn>
+          <Btn variant="secondary" size="sm" onClick={resetMonthPayments}>🗑 Очистить</Btn>
+          <Btn size="sm" onClick={()=>{setForm({date:today(),status:"paid",studentId:students[0]?.id||""});setModal(true);}}>+ Оплата</Btn>
+        </div>
+      </div>
+
+      <div className="grid-cols-3" style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:14,marginBottom:20}}>
+        <div style={{background:T.surface,borderRadius:14,padding:"18px 20px",border:`1px solid ${T.border}`,boxShadow:T.shadow}}>
+          <div style={{fontSize:11,color:T.t3,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:4}}>Начислено за {mLabel}</div>
+          <div style={{fontSize:26,fontWeight:800,color:T.t2,letterSpacing:"-0.04em"}}>{fmtM(totalCharged)} ₽</div>
+          <div style={{fontSize:11,color:T.t3,marginTop:3}}>проведено уроков</div>
+        </div>
+        <div style={{background:"#EDFBF3",borderRadius:14,padding:"18px 20px",border:"1px solid rgba(22,163,74,0.12)",boxShadow:T.shadow}}>
+          <div style={{fontSize:11,color:T.t3,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:4}}>Оплачено</div>
+          <div style={{fontSize:26,fontWeight:800,color:T.green,letterSpacing:"-0.04em"}}>{fmtM(totalPaid)} ₽</div>
+          <div style={{fontSize:11,color:T.t3,marginTop:3}}>{totalCharged>0?Math.round(totalPaid/totalCharged*100):0}% от начисленного</div>
+        </div>
+        <div style={{background:Math.max(0,totalCharged-totalPaid)>0?"#FEF2F2":T.surface2,borderRadius:14,padding:"18px 20px",border:`1px solid ${Math.max(0,totalCharged-totalPaid)>0?"rgba(220,38,38,0.12)":T.border}`,boxShadow:T.shadow}}>
+          <div style={{fontSize:11,color:T.t3,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:4}}>
+            {Math.max(0,totalCharged-totalPaid)>0?"Общий долг":"Долгов нет"}
+          </div>
+          <div style={{fontSize:26,fontWeight:800,color:Math.max(0,totalCharged-totalPaid)>0?T.red:T.green,letterSpacing:"-0.04em"}}>
+            {Math.max(0,totalCharged-totalPaid)>0?`${fmtM(Math.max(0,totalCharged-totalPaid))} ₽`:"✓"}
+          </div>
+          <div style={{fontSize:11,color:T.t3,marginTop:3}}>{Math.max(0,totalCharged-totalPaid)>0?"ожидает оплаты":"всё оплачено"}</div>
+        </div>
+      </div>
+      <div style={{fontSize:12,color:T.t3,marginBottom:16,padding:"8px 14px",background:T.surface2,borderRadius:9,border:`1px solid ${T.border}`,display:"flex",alignItems:"center",gap:8}}>
+        <span>💡</span><span>Полная история всех платежей и доходов — в разделе <strong style={{color:T.accent}}>Финансы</strong>. Здесь только текущие долги.</span>
+      </div>
+
+      <div style={{display:"flex",gap:8,marginBottom:14}}>
+        <Btn variant={onlyDebt?"secondary":"primary"} size="sm" onClick={()=>setOnlyDebt(false)}>Все ученики</Btn>
+        <Btn variant={onlyDebt?"primary":"secondary"} size="sm" onClick={()=>setOnlyDebt(true)}>Только с долгом</Btn>
+      </div>
+      <div className="grid-cols-2" style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:14}}>
+        {students.filter(s=>{
+          if(!onlyDebt)return true;
+          const ch=events.filter(e=>sameId(e.studentId,s.id)&&e.date.startsWith(mStr)&&e.type==="lesson"&&e.status==="done").length*(Number(s.price)||0);
+          const pd=payments.filter(p=>sameId(p.studentId,s.id)&&p.date?.startsWith(mStr)&&p.status!=="cancelled").reduce((a,p)=>a+(Number(p.amount)||0),0);
+          return Math.max(0,ch-pd)>0;
+        }).map(s=>{
+          const ch=events.filter(e=>sameId(e.studentId,s.id)&&e.date.startsWith(mStr)&&e.type==="lesson"&&e.status==="done").length*(Number(s.price)||0);
+          const mPays=payments.filter(p=>sameId(p.studentId,s.id)&&p.date?.startsWith(mStr));
+          const pd=mPays.filter(p=>p.status!=="cancelled").reduce((a,p)=>a+(Number(p.amount)||0),0);
+          const left=Math.max(0,ch-pd);
+          const paid=left===0&&ch>0;
+          const scheme=s.payMethod||"";
+          const isAdvance=scheme.includes("вперёд");
+          const advance=isAdvance?pd-ch:0;
+          return(
+            <Card key={s.id}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:14}}>
+                <div>
+                  <div style={{fontSize:15,fontWeight:700,letterSpacing:"-0.02em"}}>{s.name}</div>
+                  <div style={{fontSize:11,color:T.t3,marginTop:2}}>{s.subject} · {events.filter(e=>sameId(e.studentId,s.id)&&e.date.startsWith(mStr)&&e.type==="lesson"&&e.status==="done").length} ур · {fmtM(Number(s.price)||0)} ₽/ур</div>
+                  {s.payMethod&&<div style={{fontSize:10,color:T.accent2,fontWeight:600,marginTop:2}}>💳 {s.payMethod}</div>}
+                </div>
+                {(()=>{
+                  if(ch===0&&advance>0) return <Badge color={T.accent} size="sm" dot>Аванс {fmtM(advance)} ₽</Badge>;
+                  if(ch===0) return <Badge color={T.t3} size="sm">Уроков нет</Badge>;
+                  if(paid) return <Badge color={T.green} size="sm" dot>Оплачено ✓</Badge>;
+                  return <Badge color={T.red} size="sm">Долг {fmtM(left)} ₽</Badge>;
+                })()}
+              </div>
+
+              <div style={{display:"flex",gap:10,marginBottom:14,alignItems:"flex-start"}}>
+                <div style={{flex:1,background:"#EDFBF3",borderRadius:10,padding:"10px 14px",border:"1px solid rgba(22,163,74,0.12)"}}>
+                  <div style={{fontSize:9,color:T.t3,textTransform:"uppercase",letterSpacing:"0.05em",fontWeight:700,marginBottom:3}}>Оплачено</div>
+                  <div style={{fontSize:18,fontWeight:800,color:T.green,letterSpacing:"-0.03em"}}>{fmtM(pd)} ₽</div>
+                </div>
+                {left>0&&(
+                  <div style={{flex:1,background:"#FEF2F2",borderRadius:10,padding:"10px 14px",border:"1px solid rgba(220,38,38,0.12)"}}>
+                    <div style={{fontSize:9,color:T.t3,textTransform:"uppercase",letterSpacing:"0.05em",fontWeight:700,marginBottom:3}}>Долг</div>
+                    <div style={{fontSize:18,fontWeight:800,color:T.red,letterSpacing:"-0.03em"}}>{fmtM(left)} ₽</div>
+                  </div>
+                )}
+                {left===0&&ch>0&&(
+                  <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",gap:6,background:"#EDFBF3",borderRadius:10,padding:"10px 14px",border:"1px solid rgba(22,163,74,0.12)"}}>
+                    <span style={{fontSize:14,color:T.green}}>✓</span>
+                    <span style={{fontSize:12,fontWeight:700,color:T.green}}>Полностью оплачено</span>
+                  </div>
+                )}
+              </div>
+              {ch>0&&pd>0&&left>0&&(
+                <div style={{marginBottom:12}}>
+                  <PBar cur={pd} goal={Math.max(ch,1)} color={T.green}/>
+                </div>
+              )}
+
+              {justPaid===s.id&&(
+                <div style={{background:"#EDFBF3",borderRadius:9,padding:"8px 12px",marginBottom:8,fontSize:13,color:T.green,fontWeight:700,textAlign:"center",border:"1px solid rgba(22,163,74,0.2)"}}>
+                  ✓ Оплата принята!
+                </div>
+              )}
+              <div style={{display:"flex",gap:8}}>
+                {left>0&&(
+                  <Btn size="sm" variant="primary" style={{flex:1}}
+                    onClick={()=>quickPayFull(s,left)}>
+                    ✓ Оплатил {fmtM(left)} ₽
+                  </Btn>
+                )}
+                <Btn size="sm" variant="secondary" style={{flex:left>0?"0 0 auto":1}}
+                  onClick={()=>{
+                    const payDate=monthOff===0?today():`${mStr}-15`;
+                    setForm({studentId:s.id,date:payDate,amount:left||"",status:"paid"});
+                    setModal(true);
+                  }}>
+                  {left>0?"Частично":"Добавить платёж"}
+                </Btn>
+              </div>
+            </Card>
+          );
+        })}
+        {students.length===0&&<div style={{gridColumn:"1/-1"}}><Empty text="Добавьте учеников" sub="Платежи появятся после добавления учеников"/></div>}
+      </div>
+
+      {modal&&(
+        <Modal title={`Оплата — ${students.find(s=>s.id===form.studentId)?.name||"ученик"}`} onClose={()=>setModal(false)}>
+          <Field label="Ученик">
+            <Sel value={form.studentId} onChange={v=>f("studentId",Number(v))} options={[{v:"",l:"— выбрать —"},...students.map(s=>({v:s.id,l:s.name}))]}/>
+          </Field>
+          <G2>
+            <Field label="Сумма (₽)"><Inp type="number" value={form.amount} onChange={v=>f("amount",v)}/></Field>
+            <Field label="Дата"><Inp type="date" value={form.date} onChange={v=>f("date",v)}/></Field>
+          </G2>
+          {(()=>{
+            const s=students.find(x=>x.id===form.studentId);
+            const ch=s?events.filter(e=>sameId(e.studentId,s.id)&&e.date.startsWith(mStr)&&e.type==="lesson"&&e.status==="done").length*(Number(s.price)||0):0;
+            const paid=payments.filter(p=>p.studentId===form.studentId&&p.date?.startsWith(mStr)&&p.status!=="cancelled").reduce((a,p)=>a+(Number(p.amount)||0),0);
+            const debt=Math.max(0,ch-paid);
+            return debt>0?(
+              <div style={{background:"#FEF2F2",borderRadius:8,padding:"8px 12px",marginBottom:10,fontSize:12,color:T.red,fontWeight:500,border:"1px solid rgba(220,38,38,0.12)"}}>
+                Долг за {mLabel}: <strong>{fmtM(debt)} ₽</strong>
+              </div>
+            ):null;
+          })()}
+          <Field label="Заметка"><Inp value={form.note} onChange={v=>f("note",v)} placeholder="Наличные / перевод / карта..."/></Field>
+          <SaveRow onClose={()=>setModal(false)} onSave={save}/>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   TASKS
+══════════════════════════════════════════════════════════════ */
+function TasksPage({store}){
+  const{tasks,setTasks,projects}=store;
+  const[modal,setModal]=useState(false);const[form,setForm]=useState({});const[filt,setFilt]=useState("all");
+  const f=(k,v)=>setForm(p=>({...p,[k]:v}));
+  function save(){if(form.id)setTasks(tasks.map(t=>t.id===form.id?form:t));else setTasks([...tasks,{...form,id:Date.now(),status:"planned"}]);setModal(false);}
+  function del(){if(!window.confirm("Удалить задачу?"))return;const _p=tasks;setTasks(tasks.filter(t=>t.id!==form.id));store.pushUndo("Задача",()=>setTasks(_p));setModal(false);}
+  const overdue=tasks.filter(t=>t.status!=="done"&&t.deadline&&t.deadline<today()).length;
+  const filtered=filt==="overdue"?tasks.filter(t=>t.status!=="done"&&t.deadline&&t.deadline<today()):tasks;
+  const cols=["planned","inprogress","done"].map(s=>({s,items:filtered.filter(t=>t.status===s)}));
+  return(
+    <div>
+      <SH title="Задачи">
+        <Btn size="sm" onClick={()=>{setForm({priority:"medium",status:"planned"});setModal(true);}}>+ Задача</Btn>
+      </SH>
+      {overdue>0&&(
+        <div style={{display:"flex",gap:6,marginBottom:14}}>
+          <Btn size="sm" variant={filt==="all"?"primary":"secondary"} onClick={()=>setFilt("all")}>Все</Btn>
+          <Btn size="sm" variant={filt==="overdue"?"danger":"secondary"} onClick={()=>setFilt("overdue")}>Просроченные ({overdue})</Btn>
+        </div>
+      )}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:16}}>
+        {cols.map(col=>(
+          <div key={col.s}>
+            <div style={{fontWeight:700,fontSize:11,color:T.t3,marginBottom:10,textTransform:"uppercase",letterSpacing:"0.05em"}}>
+              {TST[col.s]} · {col.items.length}
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              {col.items.map(t=>{
+                const od=t.status!=="done"&&t.deadline&&t.deadline<today();
+                return(
+                  <Card key={t.id} pad={0} hover style={{cursor:"pointer",overflow:"hidden"}} onClick={()=>{setForm(t);setModal(true);}}>
+                    <div style={{display:"flex"}}>
+                      <div style={{width:3,background:PRC[t.priority]||T.t3,flexShrink:0}}/>
+                      <div style={{padding:"11px 13px",flex:1,minWidth:0}}>
+                        <div style={{fontWeight:600,fontSize:13,marginBottom:4,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{t.title}</div>
+                        {t.description&&<div style={{fontSize:11,color:T.t2,marginBottom:6,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{t.description}</div>}
+                        <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:7}}>
+                          {t.deadline&&<Badge color={od?T.red:T.accent2} size="sm">{od?"просрочено — ":""}до {fmtD(t.deadline)}</Badge>}
+                          {t.project&&<Badge color={T.green} size="sm">{projects.find(p=>p.id===t.project)?.title||""}</Badge>}
+                        </div>
+                        <div style={{display:"flex",gap:4,flexWrap:"wrap"}} onClick={e=>e.stopPropagation()}>
+                          {["planned","inprogress","done"].filter(s=>s!==t.status).map(s=>(
+                            <Btn key={s} size="sm" variant="secondary"
+                              onClick={()=>setTasks(tasks.map(x=>x.id===t.id?{...x,status:s}:x))}
+                              style={{fontSize:10,padding:"2px 8px"}}>
+                              {TST[s]}
+                            </Btn>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  </Card>
+                );
+              })}
+              {col.items.length===0&&(
+                <div style={{background:T.surface2,borderRadius:12,border:`1.5px dashed ${T.border}`,padding:"22px 14px",textAlign:"center",color:T.t3,fontSize:12}}>
+                  {col.s==="done"?"Нет выполненных":col.s==="inprogress"?"Нет в работе":"Нет задач"}
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+      {modal&&(
+        <Modal title={form.id?"Редактировать":"Новая задача"} onClose={()=>setModal(false)}>
+          <Field label="Название" required><Inp value={form.title} onChange={v=>f("title",v)} placeholder="Название задачи"/></Field>
+          <Field label="Описание"><Txa value={form.description} onChange={v=>f("description",v)} placeholder="Описание..." rows={2}/></Field>
+          <G2>
+            <Field label="Приоритет"><Sel value={form.priority} onChange={v=>f("priority",v)} options={Object.entries(PRL).map(([v,l])=>({v,l}))}/></Field>
+            <Field label="Дедлайн"><Inp type="date" value={form.deadline} onChange={v=>f("deadline",v)}/></Field>
+            <Field label="Статус"><Sel value={form.status} onChange={v=>f("status",v)} options={Object.entries(TST).map(([v,l])=>({v,l}))}/></Field>
+            <Field label="Проект"><Sel value={form.project||""} onChange={v=>f("project",Number(v)||"")} options={[{v:"",l:"— нет —"},...store.projects.map(p=>({v:p.id,l:p.title}))]}/></Field>
+          </G2>
+          <SaveRow onClose={()=>setModal(false)} onSave={save} onDelete={form.id?del:null}/>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   PROJECTS
+══════════════════════════════════════════════════════════════ */
+function ProjectsPage({store}){
+  const{projects,setProjects,tasks,expenses}=store;
+  const[modal,setModal]=useState(false);const[form,setForm]=useState({});
+  const f=(k,v)=>setForm(p=>({...p,[k]:v}));
+  function save(){if(form.id)setProjects(projects.map(p=>p.id===form.id?form:p));else setProjects([...projects,{...form,id:Date.now()}]);setModal(false);}
+  function del(){if(!window.confirm("Удалить проект?"))return;const _p=projects;setProjects(projects.filter(p=>p.id!==form.id));store.pushUndo("Проект",()=>setProjects(_p));setModal(false);}
+  return(
+    <div>
+      <SH title="Проекты"><Btn onClick={()=>{setForm({});setModal(true);}}>+ Проект</Btn></SH>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:14}}>
+        {projects.map(p=>{
+          const pT=tasks.filter(t=>t.project===p.id),done=pT.filter(t=>t.status==="done").length;
+          const pExp=expenses.filter(e=>e.project===p.id).reduce((s,e)=>s+(Number(e.amount)||0),0);
+          const profit=(Number(p.earned)||0)-(Number(p.spent)||pExp);
+          return(
+            <Card key={p.id} hover style={{cursor:"pointer"}} onClick={()=>{setForm(p);setModal(true);}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+                <div style={{fontSize:14,fontWeight:700,letterSpacing:"-0.02em",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",flex:1,marginRight:8}}>{p.title}</div>
+                <Badge color={profit>=0?T.green:T.red} size="sm">{profit>=0?"+":""}{fmtM(profit)} ₽</Badge>
+              </div>
+              {p.description&&<div style={{fontSize:12,color:T.t2,marginBottom:10,lineHeight:1.5}}>{p.description}</div>}
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:10}}>
+                {[["Задач",pT.length],["Выполнено",done],["Вложено",`${fmtM(p.spent||pExp)} ₽`],["Заработано",`${fmtM(p.earned||0)} ₽`]].map(([l,v])=>(
+                  <div key={l} style={{background:T.surface2,borderRadius:8,padding:"6px 9px",border:`1px solid ${T.border}`}}>
+                    <div style={{fontSize:9,color:T.t3,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.04em"}}>{l}</div>
+                    <div style={{fontSize:12,fontWeight:700,marginTop:2,letterSpacing:"-0.01em"}}>{v}</div>
+                  </div>
+                ))}
+              </div>
+              {pT.length>0&&<PBar cur={done} goal={pT.length} color={T.accent2}/>}
+            </Card>
+          );
+        })}
+        {projects.length===0&&<div style={{gridColumn:"1/-1"}}><Empty text="Проектов пока нет" sub="Создайте первый проект"/></div>}
+      </div>
+      {modal&&(
+        <Modal title={form.id?"Редактировать":"Новый проект"} onClose={()=>setModal(false)}>
+          <Field label="Название" required><Inp value={form.title} onChange={v=>f("title",v)} placeholder="Название проекта"/></Field>
+          <Field label="Описание"><Txa value={form.description} onChange={v=>f("description",v)} placeholder="Описание..." rows={2}/></Field>
+          <G2>
+            <Field label="Вложено (₽)"><Inp type="number" value={form.spent} onChange={v=>f("spent",v)}/></Field>
+            <Field label="Заработано (₽)"><Inp type="number" value={form.earned} onChange={v=>f("earned",v)}/></Field>
+          </G2>
+          <Field label="Заметки"><Txa value={form.notes} onChange={v=>f("notes",v)} placeholder="Заметки..." rows={2}/></Field>
+          <SaveRow onClose={()=>setModal(false)} onSave={save} onDelete={form.id?del:null}/>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   BRAIN
+══════════════════════════════════════════════════════════════ */
+function BrainPage({store}){
+  const{brain,setBrain}=store;
+  const[modal,setModal]=useState(false);const[form,setForm]=useState({});const[tagF,setTagF]=useState("");
+  const f=(k,v)=>setForm(p=>({...p,[k]:v}));
+  function save(){
+    const tags=(form.tagsRaw||"").split(",").map(t=>t.trim()).filter(Boolean);
+    const item={...form,tags,id:form.id||Date.now(),date:form.date||today()};
+    delete item.tagsRaw;
+    if(form.id)setBrain(brain.map(i=>i.id===form.id?item:i));else setBrain([...brain,item]);
+    setModal(false);
+  }
+  function del(){if(!window.confirm("Удалить запись?"))return;const _p=brain;setBrain(brain.filter(i=>i.id!==form.id));store.pushUndo("Запись",()=>setBrain(_p));setModal(false);}
+  const allTags=[...new Set(brain.flatMap(i=>i.tags||[]))];
+  const filtered=tagF?brain.filter(i=>(i.tags||[]).includes(tagF)):brain;
+  const TC={note:T.accent,idea:T.amber,link:T.green,material:T.accent2,thought:"#7C3AED"};
+  const tagCounts=allTags.map(t=>({t,n:brain.filter(i=>(i.tags||[]).includes(t)).length}));
+  return(
+    <div>
+      <SH title="Второй мозг" sub="Единое хранилище знаний, идей и мыслей">
+        <Btn onClick={()=>{setForm({type:"note",date:today()});setModal(true);}}>+ Добавить</Btn>
+      </SH>
+      <Card style={{marginBottom:16}}>
+        <div style={{fontSize:10,color:T.t3,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:10}}>Теги</div>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+          <button onClick={()=>setTagF("")} style={{padding:"4px 13px",borderRadius:99,border:`1px solid ${tagF===""?T.accent:T.border}`,cursor:"pointer",fontSize:12,fontWeight:tagF===""?700:400,background:tagF===""?T.accent:"transparent",color:tagF===""?"#fff":T.t2,fontFamily:"var(--font)",transition:"all 0.12s"}}>
+            Все ({brain.length})
+          </button>
+          {tagCounts.sort((a,b)=>b.n-a.n).map(({t,n})=>(
+            <button key={t} onClick={()=>setTagF(tagF===t?"":t)}
+              style={{padding:"4px 13px",borderRadius:99,border:`1px solid ${tagF===t?T.accent:T.border}`,cursor:"pointer",fontSize:12,fontWeight:tagF===t?700:400,background:tagF===t?T.accent:"transparent",color:tagF===t?"#fff":T.t2,fontFamily:"var(--font)",transition:"all 0.12s"}}>
+              {t} ({n})
+            </button>
+          ))}
+        </div>
+      </Card>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:14}}>
+        {filtered.sort((a,b)=>a.date>b.date?-1:1).map(i=>(
+          <Card key={i.id} hover style={{cursor:"pointer"}} onClick={()=>{setForm({...i,tagsRaw:(i.tags||[]).join(", ")});setModal(true);}}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+              <Badge color={TC[i.type]||T.t3} size="sm">{i.type}</Badge>
+              <span style={{fontSize:10,color:T.t3}}>{fmtD(i.date)}</span>
+            </div>
+            <div style={{fontWeight:600,fontSize:13,marginBottom:6,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",letterSpacing:"-0.01em"}}>{i.title}</div>
+            {i.content&&<div style={{fontSize:12,color:T.t2,lineHeight:1.6,marginBottom:8,overflow:"hidden",display:"-webkit-box",WebkitLineClamp:3,WebkitBoxOrient:"vertical"}}>{i.content}</div>}
+            {i.url&&<a href={i.url} target="_blank" onClick={e=>e.stopPropagation()} style={{fontSize:11,display:"block",marginBottom:6,color:T.accent}}>Открыть ссылку →</a>}
+            <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>{(i.tags||[]).map(t=><Badge key={t} color={T.accent2} size="sm">{t}</Badge>)}</div>
+          </Card>
+        ))}
+        {filtered.length===0&&<div style={{gridColumn:"1/-1"}}><Empty text="Ничего нет" sub="Добавьте первую запись"/></div>}
+      </div>
+      {modal&&(
+        <Modal title={form.id?"Редактировать":"Новая запись"} onClose={()=>setModal(false)} wide>
+          <G2>
+            <Field label="Тип"><Sel value={form.type} onChange={v=>f("type",v)} options={Object.keys(TC)}/></Field>
+            <Field label="Заголовок"><Inp value={form.title} onChange={v=>f("title",v)} placeholder="Название"/></Field>
+          </G2>
+          {form.type==="link"&&<Field label="URL"><Inp value={form.url} onChange={v=>f("url",v)} placeholder="https://..."/></Field>}
+          <Field label="Содержание"><Txa value={form.content} onChange={v=>f("content",v)} placeholder="Текст, мысль, конспект..." rows={5}/></Field>
+          <Field label="Теги (через запятую)"><Inp value={form.tagsRaw} onChange={v=>f("tagsRaw",v)} placeholder="Физика, Telegram, Личное"/></Field>
+          <SaveRow onClose={()=>setModal(false)} onSave={save} onDelete={form.id?del:null}/>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   KNOWLEDGE BASE
+══════════════════════════════════════════════════════════════ */
+function KBPage({store}){
+  const{kb,setKb}=store;
+  const[modal,setModal]=useState(false);const[form,setForm]=useState({});const[subj,setSubj]=useState("");
+  const f=(k,v)=>setForm(p=>({...p,[k]:v}));
+  function save(){if(form.id)setKb(kb.map(x=>x.id===form.id?form:x));else setKb([...kb,{...form,id:Date.now(),date:today()}]);setModal(false);}
+  function del(){if(!window.confirm("Удалить?"))return;const _p=kb;setKb(kb.filter(x=>x.id!==form.id));store.pushUndo("Запись",()=>setKb(_p));setModal(false);}
+  const filtered=subj?kb.filter(x=>x.subject===subj):kb;
+  return(
+    <div>
+      <SH title="База знаний" sub="Конспекты, материалы и методика">
+        <Btn onClick={()=>{setForm({subject:SUBJECTS[0]});setModal(true);}}>+ Материал</Btn>
+      </SH>
+      <div style={{display:"flex",gap:6,marginBottom:16,flexWrap:"wrap"}}>
+        <button onClick={()=>setSubj("")} style={{padding:"4px 14px",borderRadius:99,border:`1px solid ${subj===""?T.accent:T.border}`,cursor:"pointer",fontSize:12,fontWeight:subj===""?700:400,background:subj===""?T.accent:"transparent",color:subj===""?"#fff":T.t2,fontFamily:"var(--font)",transition:"all 0.12s"}}>Всё</button>
+        {SUBJECTS.map(s=>(
+          <button key={s} onClick={()=>setSubj(subj===s?"":s)}
+            style={{padding:"4px 14px",borderRadius:99,border:`1px solid ${subj===s?(SUBJ_COLORS[s]||T.accent):T.border}`,cursor:"pointer",fontSize:12,fontWeight:subj===s?700:400,background:subj===s?(SUBJ_COLORS[s]||T.accent):"transparent",color:subj===s?"#fff":T.t2,fontFamily:"var(--font)",transition:"all 0.12s"}}>
+            {s}
+          </button>
+        ))}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:14}}>
+        {filtered.sort((a,b)=>a.date>b.date?-1:1).map(x=>(
+          <Card key={x.id} hover style={{cursor:"pointer"}} onClick={()=>{setForm(x);setModal(true);}}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+              <Badge color={SUBJ_COLORS[x.subject]||T.t3} size="sm">{x.subject}</Badge>
+              {x.topic&&<span style={{fontSize:10,color:T.t3}}>{x.topic}</span>}
+            </div>
+            <div style={{fontWeight:600,fontSize:13,marginBottom:6,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",letterSpacing:"-0.01em"}}>{x.title}</div>
+            {x.content&&<div style={{fontSize:12,color:T.t2,lineHeight:1.6,overflow:"hidden",display:"-webkit-box",WebkitLineClamp:3,WebkitBoxOrient:"vertical"}}>{x.content}</div>}
+          </Card>
+        ))}
+        {filtered.length===0&&<div style={{gridColumn:"1/-1"}}><Empty text="Пусто" sub="Добавьте первый материал"/></div>}
+      </div>
+      {modal&&(
+        <Modal title={form.id?"Редактировать":"Новый материал"} onClose={()=>setModal(false)} wide>
+          <G2>
+            <Field label="Предмет"><Sel value={form.subject} onChange={v=>f("subject",v)} options={SUBJECTS}/></Field>
+            <Field label="Тема"><Sel value={form.topic||""} onChange={v=>f("topic",v)} options={[""].concat(KBT[form.subject]||[])}/></Field>
+          </G2>
+          <Field label="Название" required><Inp value={form.title} onChange={v=>f("title",v)} placeholder="Название материала"/></Field>
+          <Field label="Содержание"><Txa value={form.content} onChange={v=>f("content",v)} placeholder="Конспект, задачи, методика..." rows={6}/></Field>
+          <SaveRow onClose={()=>setModal(false)} onSave={save} onDelete={form.id?del:null}/>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   JOURNAL
+══════════════════════════════════════════════════════════════ */
+function JournalPage({store}){
+  const{journal,setJournal}=store;
+  const[modal,setModal]=useState(false);const[form,setForm]=useState({});
+  const f=(k,v)=>setForm(p=>({...p,[k]:v}));
+  function save(){const item={...form,id:form.id||Date.now(),date:form.date||today()};if(form.id)setJournal(journal.map(j=>j.id===form.id?item:j));else setJournal([item,...journal]);setModal(false);}
+  function del(){const _p=journal;setJournal(journal.filter(j=>j.id!==form.id));store.pushUndo("Запись",()=>setJournal(_p));setModal(false);}
+  const ME={great:"Отлично",good:"Хорошо",ok:"Нейтрально",tired:"Устал",bad:"Плохо"};
+  const MC={great:T.green,good:T.accent,ok:T.amber,tired:T.accent2,bad:T.red};
+  const last30=Array.from({length:30},(_,i)=>{const d=new Date();d.setDate(d.getDate()-29+i);return iso(d);});
+  return(
+    <div>
+      <SH title="Журнал жизни" sub="История работы и жизни">
+        <Btn onClick={()=>{setForm({date:today(),mood:"good"});setModal(true);}}>+ Запись</Btn>
+      </SH>
+      {journal.length>0&&(
+        <Card style={{marginBottom:16}}>
+          <div style={{fontSize:10,color:T.t3,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:10}}>Настроение за 30 дней</div>
+          <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
+            {last30.map(dk=>{
+              const entry=journal.find(j=>j.date===dk);
+              return(
+                <div key={dk}
+                  title={`${fmtD(dk)}${entry?` · ${ME[entry.mood]}`:" — нет записи"}`}
+                  style={{width:16,height:16,borderRadius:4,background:entry?MC[entry.mood]||T.t3:T.border2,cursor:entry?"pointer":"default",flexShrink:0,transition:"transform 0.1s"}}
+                  onClick={()=>{if(entry){setForm(entry);setModal(true);}}}
+                />
+              );
+            })}
+          </div>
+          <div style={{display:"flex",gap:12,marginTop:8,flexWrap:"wrap"}}>
+            {Object.entries(ME).map(([k,label])=>(
+              <div key={k} style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:T.t2}}>
+                <div style={{width:8,height:8,borderRadius:2,background:MC[k]}}/>
+                {label} {journal.filter(j=>j.mood===k).length}
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        {[...journal].sort((a,b)=>a.date>b.date?-1:1).map(j=>(
+          <Card key={j.id} hover style={{cursor:"pointer"}} onClick={()=>{setForm(j);setModal(true);}}>
+            <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+              <div style={{width:8,height:8,borderRadius:2,background:MC[j.mood]||T.t3,flexShrink:0}}/>
+              <span style={{fontSize:13,fontWeight:700,letterSpacing:"-0.02em"}}>{fmtD(j.date)}</span>
+              <Badge color={MC[j.mood]||T.t3} size="sm">{ME[j.mood]||"запись"}</Badge>
+              {j.tag&&<Badge color={T.accent2} size="sm">{j.tag}</Badge>}
+            </div>
+            <div style={{fontSize:13,lineHeight:1.7,whiteSpace:"pre-wrap",overflow:"hidden",display:"-webkit-box",WebkitLineClamp:4,WebkitBoxOrient:"vertical",color:T.text}}>{j.text}</div>
+          </Card>
+        ))}
+        {journal.length===0&&<Empty text="Дневник пуст" sub="Здесь будет история вашей работы и жизни"/>}
+      </div>
+      {modal&&(
+        <Modal title={form.id?"Редактировать запись":"Новая запись"} onClose={()=>setModal(false)} wide>
+          <G2>
+            <Field label="Дата"><Inp type="date" value={form.date} onChange={v=>f("date",v)}/></Field>
+            <Field label="Настроение">
+              <div style={{display:"flex",gap:6,marginTop:4}}>
+                {Object.entries(MC).map(([k,c])=>(
+                  <button key={k} onClick={()=>f("mood",k)}
+                    style={{
+                      width:32,height:32,borderRadius:8,background:c+(form.mood===k?"":"18"),
+                      border:form.mood===k?`2px solid ${c}`:`2px solid transparent`,
+                      cursor:"pointer",transition:"all 0.12s",flexShrink:0
+                    }}
+                    title={ME[k]}
+                  />
+                ))}
+              </div>
+            </Field>
+          </G2>
+          <Field label="Тег"><Inp value={form.tag} onChange={v=>f("tag",v)} placeholder="Урок, Проект, Личное..."/></Field>
+          <Field label="Запись"><Txa value={form.text} onChange={v=>f("text",v)} placeholder="Что произошло? Мысли..." rows={6}/></Field>
+          <SaveRow onClose={()=>setModal(false)} onSave={save} onDelete={form.id?del:null}/>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   STATS
+══════════════════════════════════════════════════════════════ */
+function StatsPage({store}){
+  const{events,expenses,students,incomes}=store;
+  const done=events.filter(e=>e.type==="lesson"&&e.status==="done");
+  const months=Array.from({length:6},(_,i)=>{const d=new Date();d.setMonth(d.getMonth()-i);return localYM(d);}).reverse();
+  const byM=months.map(m=>({
+    m,
+    inc:incomes.filter(i=>i.date.startsWith(m)).reduce((s,i)=>s+(Number(i.amount)||0),0),
+    cnt:done.filter(l=>l.date.startsWith(m)).length,
+    exp:expenses.filter(e=>e.date.startsWith(m)).reduce((s,e)=>s+(Number(e.amount)||0),0),
+    v:incomes.filter(i=>i.date.startsWith(m)).reduce((s,i)=>s+(Number(i.amount)||0),0)
+  }));
+  const bySt=students.map(s=>({
+    s,
+    inc:done.filter(l=>l.studentId===s.id).length*(Number(s.price)||0),
+    cnt:done.filter(l=>l.studentId===s.id).length
+  })).filter(x=>x.cnt>0).sort((a,b)=>b.inc-a.inc);
+  const byDay=DS.map((d,i)=>({d,cnt:done.filter(l=>{const wd=new Date(l.date).getDay();return(wd===0?6:wd-1)===i;}).length}));
+  const expCat=ECATS.map((c,i)=>({c,t:expenses.filter(e=>e.category===c).reduce((s,e)=>s+(Number(e.amount)||0),0),color:["#2C5EE8","#7C3AED","#2A9D5C","#C47C00","#D63A3A","#5B5BD6","#636366"][i]})).filter(x=>x.t>0);
+  const totalHrs=done.reduce((s,l)=>s+(Number(l.duration)||60)/60,0);
+  const avgP=students.length?Math.round(students.reduce((s,st)=>s+(Number(st.price)||0),0)/students.length):0;
+  const totalInc=incomes.reduce((s,i)=>s+(Number(i.amount)||0),0);
+
+  const subjDist=SUBJECTS.map((subj,i)=>({
+    name:subj,
+    value:students.filter(s=>s.subject===subj).length,
+    color:["#2C5EE8","#7C3AED","#2A9D5C","#C47C00","#636366"][i]
+  })).filter(x=>x.value>0);
+
+  const statusDist=[
+    {name:"Проведено",value:events.filter(e=>e.type==="lesson"&&e.status==="done").length,color:T.green},
+    {name:"Запланировано",value:events.filter(e=>e.type==="lesson"&&e.status==="planned").length,color:T.accent},
+    {name:"Отменено",value:events.filter(e=>e.type==="lesson"&&e.status==="cancelled").length,color:T.red},
+    {name:"Неявка",value:events.filter(e=>e.type==="lesson"&&e.status==="missed").length,color:T.amber},
+  ].filter(x=>x.value>0);
+
+  return(
+    <div>
+      <div style={{fontSize:22,fontWeight:800,marginBottom:20,letterSpacing:"-0.04em"}}>Аналитика</div>
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:20}}>
+        {[
+          {l:"Всего уроков",v:done.length,c:T.accent,bg:"#EEF2FF"},
+          {l:"Часов преподавания",v:totalHrs.toFixed(0),c:T.accent2,bg:"#F3F0FF"},
+          {l:"Средняя стоимость",v:`${fmtM(avgP)} ₽`,c:T.green,bg:"#EDFBF3"},
+          {l:"Всего заработано",v:`${fmtM(totalInc)} ₽`,c:T.amber,bg:"#FFFBEB"},
+        ].map((x,i)=>(
+          <div key={x.l} className="anim-fade-up" style={{background:x.bg,borderRadius:14,padding:"16px 18px",border:`1px solid ${T.border}`,boxShadow:T.shadow,animationDelay:`${i*0.05}s`}}>
+            <div style={{fontSize:22,fontWeight:800,color:x.c,letterSpacing:"-0.04em",marginBottom:3}}>{x.v}</div>
+            <div style={{fontSize:11,color:T.t2,fontWeight:500}}>{x.l}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:16}}>
+        <Card>
+          <div style={{fontSize:14,fontWeight:700,marginBottom:16,letterSpacing:"-0.02em"}}>Динамика дохода</div>
+          <LineChart data={byM} height={140} color={T.accent} valueKey="inc" labelKey="m"/>
+        </Card>
+
+        <Card>
+          <div style={{fontSize:14,fontWeight:700,marginBottom:16,letterSpacing:"-0.02em"}}>Ученики по предметам</div>
+          {subjDist.length===0?<Empty text="Нет данных"/>:(
+            <div style={{display:"flex",gap:24,alignItems:"center"}}>
+              <DonutChart
+                segments={subjDist} size={140} stroke={16}
+                label={students.length}
+                sublabel="учеников"
+              />
+              <div style={{flex:1}}>
+                {subjDist.map(s=>(
+                  <div key={s.name} style={{display:"flex",alignItems:"center",gap:8,marginBottom:7}}>
+                    <div style={{width:8,height:8,borderRadius:2,background:s.color,flexShrink:0}}/>
+                    <div style={{flex:1,fontSize:12,color:T.t2}}>{s.name}</div>
+                    <div style={{fontSize:13,fontWeight:700,color:s.color}}>{s.value}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </Card>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:16}}>
+        <Card>
+          <div style={{fontSize:14,fontWeight:700,marginBottom:16,letterSpacing:"-0.02em"}}>Уроков по месяцам</div>
+          <BarChart data={byM} valueKey="cnt" labelKey="m" color={T.accent2} height={130}/>
+        </Card>
+
+        <Card>
+          <div style={{fontSize:14,fontWeight:700,marginBottom:16,letterSpacing:"-0.02em"}}>Статусы уроков</div>
+          {statusDist.length===0?<Empty text="Нет данных"/>:(
+            <div style={{display:"flex",gap:24,alignItems:"center"}}>
+              <DonutChart
+                segments={statusDist} size={140} stroke={16}
+                label={events.filter(e=>e.type==="lesson").length}
+                sublabel="всего уроков"
+              />
+              <div style={{flex:1}}>
+                {statusDist.map(s=>(
+                  <div key={s.name} style={{display:"flex",alignItems:"center",gap:8,marginBottom:7}}>
+                    <div style={{width:8,height:8,borderRadius:2,background:s.color,flexShrink:0}}/>
+                    <div style={{flex:1,fontSize:12,color:T.t2}}>{s.name}</div>
+                    <div style={{fontSize:13,fontWeight:700}}>{s.value}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </Card>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+        <Card>
+          <div style={{fontSize:14,fontWeight:700,marginBottom:16,letterSpacing:"-0.02em"}}>Нагрузка по дням недели</div>
+          <BarChart data={byDay} valueKey="cnt" labelKey="d" color={T.green} height={110}/>
+        </Card>
+
+        <Card>
+          <div style={{fontSize:14,fontWeight:700,marginBottom:16,letterSpacing:"-0.02em"}}>Расходы по категориям</div>
+          {expCat.length===0?<Empty text="Нет данных"/>:(
+            <div style={{display:"flex",gap:20,alignItems:"center"}}>
+              <DonutChart
+                segments={expCat.map(x=>({value:x.t,color:x.color}))}
+                size={130} stroke={14}
+              />
+              <div style={{flex:1}}>
+                {expCat.map(x=>(
+                  <div key={x.c} style={{display:"flex",alignItems:"center",gap:7,marginBottom:6}}>
+                    <div style={{width:8,height:8,borderRadius:2,background:x.color,flexShrink:0}}/>
+                    <div style={{flex:1,fontSize:11,color:T.t2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{x.c}</div>
+                    <div style={{fontSize:12,fontWeight:700}}>{fmtM(x.t)} ₽</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </Card>
+
+        <Card>
+          <div style={{fontSize:14,fontWeight:700,marginBottom:14,letterSpacing:"-0.02em"}}>Топ учеников</div>
+          {bySt.length===0?<Empty text="Нет данных"/>:bySt.slice(0,6).map(({s,inc,cnt},i)=>(
+            <div key={s.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:`1px solid ${T.border2}`}}>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <span style={{fontSize:11,fontWeight:800,color:i===0?T.amber:T.t3,width:16,letterSpacing:"-0.02em"}}>#{i+1}</span>
+                <div>
+                  <div style={{fontWeight:600,fontSize:13}}>{s.name}</div>
+                  <div style={{fontSize:10,color:T.t3}}>{cnt} уроков · {s.subject}</div>
+                </div>
+              </div>
+              <span style={{fontWeight:700,color:T.green,fontSize:13}}>{fmtM(inc)} ₽</span>
+            </div>
+          ))}
+        </Card>
+
+        <Card>
+          <div style={{fontSize:14,fontWeight:700,marginBottom:16,letterSpacing:"-0.02em"}}>Доходы vs Расходы</div>
+          <div style={{display:"flex",gap:14,marginBottom:12}}>
+            <div style={{display:"flex",alignItems:"center",gap:5,fontSize:11,color:T.t2}}>
+              <div style={{width:12,height:3,borderRadius:99,background:T.accent}}/>Доход
+            </div>
+            <div style={{display:"flex",alignItems:"center",gap:5,fontSize:11,color:T.t2}}>
+              <div style={{width:12,height:3,borderRadius:99,background:T.red}}/>Расходы
+            </div>
+          </div>
+          <BarChart
+            data={byM.map(m=>({...m,active:m.m===localYM(new Date())}))}
+            valueKey="inc" labelKey="m" color={T.accent} height={120} currency/>
+        </Card>
+      </div>
+
+      {/* Годовая статистика */}
+      <Card style={{marginTop:14}}>
+        <div style={{fontWeight:700,fontSize:14,marginBottom:16,letterSpacing:"-0.02em"}}>Годовая статистика</div>
+        {(()=>{
+          const curY=new Date().getFullYear();
+          const years=[...new Set([
+            ...incomes.map(i=>i.date?.slice(0,4)),
+            ...events.filter(e=>e.status==="done").map(e=>e.date?.slice(0,4))
+          ].filter(Boolean))].sort().reverse();
+          if(years.length===0) return <Empty text="Недостаточно данных"/>;
+          return years.map(yr=>{
+            const yInc=incomes.filter(i=>i.date?.startsWith(yr)).reduce((s,i)=>s+(Number(i.amount)||0),0);
+            const yExp=expenses.filter(e=>e.date?.startsWith(yr)).reduce((s,e)=>s+(Number(e.amount)||0),0);
+            const yLess=events.filter(e=>e.date?.startsWith(yr)&&e.status==="done"&&e.type==="lesson").length;
+            const yHrs=events.filter(e=>e.date?.startsWith(yr)&&e.status==="done"&&e.type==="lesson").reduce((s,e)=>s+(Number(e.duration)||60)/60,0);
+            const isCur=yr===String(curY);
+            return(
+              <div key={yr} style={{marginBottom:16,padding:"14px 16px",background:isCur?"#EEF2FF":T.surface2,borderRadius:12,border:`1px solid ${isCur?T.accent:T.border}`}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                  <div style={{fontSize:16,fontWeight:800,color:isCur?T.accent:T.tx}}>{yr} {isCur&&<span style={{fontSize:11,background:T.accent,color:"#fff",borderRadius:6,padding:"1px 7px",marginLeft:6}}>текущий</span>}</div>
+                  <div style={{fontSize:13,fontWeight:700,color:yInc-yExp>=0?T.green:T.red}}>{yInc-yExp>=0?"+ ":"− "}{fmtM(Math.abs(yInc-yExp))} ₽ прибыль</div>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8}}>
+                  {[
+                    {l:"Доход",v:`${fmtM(yInc)} ₽`,c:T.green},
+                    {l:"Расходы",v:`${fmtM(yExp)} ₽`,c:T.red},
+                    {l:"Уроков",v:yLess,c:T.accent},
+                    {l:"Часов",v:yHrs.toFixed(0),c:T.accent2},
+                  ].map(x=>(
+                    <div key={x.l} style={{textAlign:"center"}}>
+                      <div style={{fontSize:18,fontWeight:800,color:x.c,letterSpacing:"-0.03em"}}>{x.v}</div>
+                      <div style={{fontSize:10,color:T.t3,marginTop:1,fontWeight:600,textTransform:"uppercase"}}>{x.l}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          });
+        })()}
+      </Card>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   GOALS
+══════════════════════════════════════════════════════════════ */
+function GoalsPage({store}){
+  const{goals,setGoals,events,incomes}=store;
+  const[modal,setModal]=useState(false);const[form,setForm]=useState({});
+  const f=(k,v)=>setForm(p=>({...p,[k]:v}));
+  function save(){const g={...form,id:form.id||Date.now()};if(form.id)setGoals(goals.map(x=>x.id===form.id?g:x));else setGoals([...goals,g]);setModal(false);}
+  function del(){const _p=goals;setGoals(goals.filter(g=>g.id!==form.id));store.pushUndo("Цель",()=>setGoals(_p));setModal(false);}
+  const now=new Date(),mStr=localYM(now);
+  const mInc=incomes.filter(i=>i.date.startsWith(mStr)).reduce((s,i)=>s+(Number(i.amount)||0),0);
+  const mCnt=events.filter(e=>e.date.startsWith(mStr)&&e.type==="lesson"&&e.status==="done").length;
+  const day=now.getDate(),dim2=new Date(now.getFullYear(),now.getMonth()+1,0).getDate();
+  return(
+    <div>
+      <SH title="Цели"><Btn onClick={()=>{setForm({color:T.accent});setModal(true);}}>+ Цель</Btn></SH>
+      <div style={{fontSize:10,color:T.t3,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:12}}>Этот месяц</div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:22}}>
+        {[
+          {l:"Доход за месяц",cur:mInc,fcast:`Прогноз: ${fmtM(day>0?Math.round(mInc/day*dim2):0)} ₽`,c:T.accent,key:"monthIncome"},
+          {l:"Уроков за месяц",cur:mCnt,fcast:`Прогноз: ${day>0?Math.round(mCnt/day*dim2):0} уроков`,c:T.accent2,key:"monthLessons"}
+        ].map(ag=>{
+          const goal=goals.find(g=>g.autoKey===ag.key);
+          const pct=goal&&goal.target>0?Math.min(100,Math.round(ag.cur/goal.target*100)):0;
+          return(
+            <Card key={ag.l}>
+              <div style={{display:"flex",alignItems:"center",gap:18}}>
+                {goal&&<RingGauge pct={pct} color={ag.c} size={76} stroke={7}/>}
+                <div style={{flex:1}}>
+                  <div style={{fontSize:13,fontWeight:700,marginBottom:7,letterSpacing:"-0.02em"}}>{ag.l}</div>
+                  {goal?(
+                    <>
+                      <div style={{marginBottom:7}}><PBar cur={ag.cur} goal={goal.target} color={ag.c}/></div>
+                      <div style={{fontSize:11,color:T.t2}}>{ag.fcast}</div>
+                    </>
+                  ):(
+                    <div>
+                      <div style={{fontSize:13,color:T.t2,marginBottom:7}}>Сейчас: <strong style={{color:ag.c}}>{ag.cur}</strong></div>
+                      <Btn size="sm" variant="secondary" onClick={()=>{setForm({autoKey:ag.key,label:ag.l,color:ag.c});setModal(true);}}>Установить цель</Btn>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </Card>
+          );
+        })}
+      </div>
+
+      {goals.filter(g=>!g.autoKey).length>0&&(
+        <>
+          <div style={{fontSize:10,color:T.t3,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:12}}>Мои цели</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:14}}>
+            {goals.filter(g=>!g.autoKey).map(g=>{
+              const pct=g.target>0?Math.min(100,Math.round((g.current||0)/g.target*100)):0;
+              return(
+                <Card key={g.id} hover style={{cursor:"pointer"}} onClick={()=>{setForm(g);setModal(true);}}>
+                  <div style={{display:"flex",alignItems:"center",gap:14}}>
+                    <RingGauge pct={pct} color={g.color||T.accent} size={64} stroke={6}/>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:13,fontWeight:700,marginBottom:3,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",letterSpacing:"-0.02em"}}>{g.label||g.title}</div>
+                      {g.deadline&&<div style={{fontSize:11,color:T.t3}}>до {fmtD(g.deadline)}</div>}
+                      <div style={{marginTop:5}}><PBar cur={g.current||0} goal={g.target||1} color={g.color||T.accent}/></div>
+                    </div>
+                  </div>
+                </Card>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {modal&&(
+        <Modal title={form.id?"Редактировать цель":"Новая цель"} onClose={()=>setModal(false)}>
+          <Field label="Название цели"><Inp value={form.label||form.title} onChange={v=>f("label",v)} placeholder="Например: Накопить на ноутбук"/></Field>
+          <G2>
+            <Field label="Целевое значение"><Inp type="number" value={form.target} onChange={v=>f("target",v)}/></Field>
+            <Field label="Текущее значение"><Inp type="number" value={form.current} onChange={v=>f("current",v)}/></Field>
+            <Field label="Дедлайн"><Inp type="date" value={form.deadline} onChange={v=>f("deadline",v)}/></Field>
+            <Field label="Цвет">
+              <div style={{display:"flex",gap:7,marginTop:4}}>
+                {[T.accent,T.accent2,T.green,T.amber,T.red,"#7C3AED"].map(c=>(
+                  <div key={c} onClick={()=>f("color",c)}
+                    style={{width:22,height:22,borderRadius:6,background:c,cursor:"pointer",border:form.color===c?`3px solid ${T.text}`:"3px solid transparent",transition:"border 0.12s"}}
+                  />
+                ))}
+              </div>
+            </Field>
+          </G2>
+          <Field label="Заметки"><Inp value={form.notes} onChange={v=>f("notes",v)} placeholder="Описание..."/></Field>
+          <SaveRow onClose={()=>setModal(false)} onSave={save} onDelete={form.id?del:null}/>
+        </Modal>
+      )}
+    </div>
+  );
+}
+function App(){
+  const[tab,setTab]=useState("home");
+  const[dark,setDark]=useStore("fhq_dark",false);
+  const[user,setUser]=useState(()=>{
+    try{
+      if(GDRIVE_CLIENT_ID!=="YOUR_GOOGLE_CLIENT_ID"){
+        const choice=localStorage.getItem("fhq_gdrive_choice");
+        const savedToken=localStorage.getItem("fhq_gdrive_token");
+        if(choice==="google"&&savedToken){
+          gToken=savedToken;
+          return {type:"google",token:savedToken};
+        }
+        if(choice==="local") return null;
+        return undefined;
+      }
+      return null;
+    }catch{return undefined;}
+  });
+  const[syncStatus,setSyncStatus]=useState("offline");
+  const dev=useDevice();
+  const[events,setEvents]=useStore("lhq_events",[]);
+  const[students,setStudents]=useStore("lhq_students",[]);
+  const[expenses,setExpenses]=useStore("lhq_expenses",[]);
+  const[incomes,setIncomes]=useStore("lhq_incomes",[]);
+  const[tasks,setTasks]=useStore("lhq_tasks",[]);
+  const[ideas,setIdeas]=useStore("lhq_ideas",[]);
+  const[projects,setProjects]=useStore("lhq_projects",[]);
+  const[goals,setGoals]=useStore("lhq_goals",[]);
+  const[journal,setJournal]=useStore("lhq_journal",[]);
+  const[kb,setKb]=useStore("lhq_kb",[]);
+  const[offline,setOffline]=useStore("lhq_offline",[]);
+  const[payments,setPayments]=useStore("lhq_payments",[]);
+  const[rls,setRls]=useStore("lhq_recurring",[]);
+  const[excs,setExcs]=useStore("lhq_exceptions",[]);
+  const[brain,setBrain]=useStore("lhq_brain",[]);
+  const[expTpl,setExpTpl]=useStore("lhq_exptpl",[]);
+  const[lessonLog,setLessonLog]=useStore("lhq_lessonlog",[]);
+  const[dockOrder,setDockOrder]=useStore("fhq_dockorder",null);
+  const[homeTiles,setHomeTiles]=useStore("fhq_hometiles",null);
+  const[pageStyles,setPageStyles]=useStore("fhq_pagestyles",{});
+
+  useEffect(()=>{document.body.classList.toggle("dark",dark);},[dark]);
+  useEffect(()=>{if(pageStyles&&pageStyles.accent){document.documentElement.style.setProperty("--accent",pageStyles.accent);}},[pageStyles]);
+
+  const migratedRef=useRef(false);
+  useEffect(()=>{
+    const saved=localStorage.getItem("fhq_gdrive_token");
+    if(saved&&user&&user.type==="google"&&!migratedRef.current){
+      migratedRef.current=true;
+      gToken=saved;
+      setSyncStatus("syncing");
+      gLoad(saved).then(cloud=>{
+        if(cloud){
+          // Объединяем облако с локальными данными по id — ничего не затирается.
+          const mrg=(setter,arr)=>setter(prev=>mergeById(prev, arr||[]));
+          mrg(setStudents,  cloud.students);
+          mrg(setEvents,    cloud.events);
+          mrg(setTasks,     cloud.tasks);
+          mrg(setPayments,  cloud.payments);
+          mrg(setIncomes,   cloud.incomes);
+          mrg(setExpenses,  cloud.expenses);
+          mrg(setBrain,     cloud.brain);
+          mrg(setKb,        cloud.kb);
+          mrg(setJournal,   cloud.journal);
+          mrg(setProjects,  cloud.projects);
+          mrg(setGoals,     cloud.goals);
+          mrg(setRls,       cloud.rls);
+          mrg(setExcs,      cloud.excs);
+          mrg(setExpTpl,    cloud.expTpl);
+          mrg(setLessonLog, cloud.lessonLog);
+          mrg(setIdeas,     cloud.ideas);    // раньше не синхронизировались
+          mrg(setOffline,   cloud.offline);  // раньше не синхронизировались
+          if(cloud.dockOrder)setDockOrder(cloud.dockOrder);
+          if(cloud.homeTiles)setHomeTiles(cloud.homeTiles);
+          if(cloud.pageStyles)setPageStyles(cloud.pageStyles);
+        }
+        setSyncStatus("synced");
+      }).catch(()=>setSyncStatus("error"));
+    }
+  },[user]);
+
+  const syncTimerRef=useRef(null);
+  const triggerSync=useCallback(()=>{
+    if(!user||user.type!=="google"||!gToken)return;
+    setSyncStatus("syncing");
+    clearTimeout(syncTimerRef.current);
+    syncTimerRef.current=setTimeout(()=>{
+      gSave({events,students,expenses,incomes,tasks,payments,rls,excs,brain,kb,journal,projects,goals,ideas,offline,expTpl,lessonLog,dockOrder,homeTiles,pageStyles,_savedAt:new Date().toISOString()})
+        .then(()=>setSyncStatus("synced"))
+        .catch(()=>setSyncStatus("error"));
+    },2000);
+  },[user,events,students,expenses,incomes,tasks,payments,rls,excs,brain,kb,journal,projects,goals,ideas,offline,expTpl,lessonLog,dockOrder,homeTiles,pageStyles])
+
+  const firstSyncRef=useRef(true);
+  useEffect(()=>{
+    if(firstSyncRef.current){firstSyncRef.current=false;return;}
+    triggerSync();
+  },[triggerSync]);
+
+  const autoComplete=useCallback(()=>{
+    const now=new Date();let changed=false;
+    const upd=events.map(ev=>{
+      if(ev.type!=="lesson"||ev.status==="done"||ev.status==="cancelled"||ev.status==="missed")return ev;
+      try{
+        if(new Date(ev.date+"T"+(ev.time?ev.time.slice(0,5):"00:00"))<now){
+          changed=true;
+          return{...ev,status:"done"};
+        }
+      }catch{}
+      return ev;
+    });
+    const pStart=new Date(now);pStart.setMonth(pStart.getMonth()-3);
+    const recPast=genRec(rls,excs,students,iso(pStart),iso(now));
+    recPast.forEach(r=>{
+      const dt=new Date(r.date+"T"+(r.time?r.time.slice(0,5):"00:00"));
+      if(dt>=now)return;
+      if(upd.some(e=>e.recurringId===r.recurringId&&e.date===r.date))return;
+      upd.push({...r,id:"m"+Date.now()+Math.random(),isRecurring:false,status:"done"});
+      changed=true;
+    });
+    if(changed)setEvents([...upd]);
+  },[events,students,rls,excs]);
+  useEffect(()=>{autoComplete();},[]);
+
+  const[sq,setSq]=useState("");
+  const[quickLog,setQuickLog]=useState(null);
+  const[showSearch,setShowSearch]=useState(false);
+  const[palOpen,setPalOpen]=useState(false);
+  const[settingsOpen,setSettingsOpen]=useState(false);
+  const[calModal,setCalModal]=useState(false);
+  const sRef=useRef(null);
+  const sq2=useDebounce(sq,300);
+
+  const sIdx=useMemo(()=>[
+    ...students.map(s=>({type:"Ученик",title:s.name+(s.subject?" · "+s.subject:""),tab:"students"})),
+    ...events.map(e=>({type:"Событие",title:e.title,tab:"calendar"})),
+    ...tasks.map(t=>({type:"Задача",title:t.title,tab:"tasks"})),
+    ...projects.map(p=>({type:"Проект",title:p.title,tab:"projects"})),
+    ...brain.map(b=>({type:"Знание",title:b.title,tab:"brain"})),
+    ...(Array.isArray(lessonLog)?lessonLog:[]).map(l=>{const st=students.find(s=>sameId(s.id,l.studentId));return{type:"Урок",title:l.topic+(st?" — "+st.name:""),tab:"students"};}),
+    ...kb.map(k=>({type:"База знаний",title:k.title||k.topic,tab:"kb"})),
+  ],[students,events,tasks,projects,brain,lessonLog,kb]);
+
+  const sRes=useMemo(()=>{
+    if(!sq2.trim())return[];
+    const q=sq2.toLowerCase();
+    return sIdx.filter(x=>x.title?.toLowerCase().includes(q)).slice(0,8);
+  },[sq2,sIdx]);
+
+  useEffect(()=>{
+    const h=e=>{
+      if(e.target.tagName==="INPUT"||e.target.tagName==="TEXTAREA"||e.target.tagName==="SELECT")return;
+      if((e.ctrlKey||e.metaKey)&&e.key==="k"){e.preventDefault();setPalOpen(true);}
+      if(e.key==="c"&&!e.ctrlKey&&!e.metaKey){setTab("calendar");setCalModal(true);}
+      if(e.key==="h"&&!e.ctrlKey&&!e.metaKey){setTab("home");}
+    };
+    window.addEventListener("keydown",h);return()=>window.removeEventListener("keydown",h);
+  },[]);
+
+  function expData(){
+    const d={events,students,expenses,incomes,tasks,ideas,projects,goals,journal,kb,offline,payments,rls,excs,brain,expTpl,lessonLog,dockOrder,homeTiles,pageStyles,_exported:new Date().toISOString()};
+    const b=new Blob([JSON.stringify(d,null,2)],{type:"application/json"});
+    const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download=`fizmat_${today()}.json`;a.click();
+    try{ localStorage.setItem("fhq_last_export",String(Date.now())); }catch{}
+    const nd=document.getElementById("fhq-backup-nudge"); if(nd) nd.remove();
+  }
+
+  function exportPDF(){
+    const t=today(),mStr=localYM(new Date());
+    const wDates=getWeek(0);
+    const wS=iso(wDates[0]),wE=iso(wDates[6]);
+    const recW=genRec(rls,excs,students,wS,wE);
+    const weekEv=[...events.filter(e=>e.date>=wS&&e.date<=wE),...recW.filter(r=>!events.some(e=>e.date===r.date&&e.time===r.time&&e.studentId===r.studentId))].sort((a,b)=>(a.date+a.time)>(b.date+b.time)?1:-1);
+    const mInc=incomes.filter(i=>i.date?.startsWith(mStr)).reduce((s,i)=>s+(Number(i.amount)||0),0);
+    const mExp=expenses.filter(e=>e.date?.startsWith(mStr)).reduce((s,e)=>s+(Number(e.amount)||0),0);
+    const DSloc=["Вс","Пн","Вт","Ср","Чт","Пт","Сб"];
+    const rows=weekEv.map(e=>{const st=students.find(s=>sameId(s.id,e.studentId));const d=new Date(e.date);return `<tr><td>${DSloc[d.getDay()]} ${d.getDate()}.${String(d.getMonth()+1).padStart(2,"0")}</td><td>${e.time?.slice(0,5)||""}</td><td>${e.title||st?.name||"Событие"}</td><td>${st?.subject||""}</td><td style="text-align:right">${e.type==="lesson"?fmtM(e.price||st?.price||0)+" ₽":""}</td></tr>`;}).join("");
+    const studRows=students.map(s=>{
+      const ch=events.filter(e=>sameId(e.studentId,s.id)&&e.date.startsWith(mStr)&&e.type==="lesson"&&e.status==="done").length*(Number(s.price)||0);
+      const pd=payments.filter(p=>sameId(p.studentId,s.id)&&p.date?.startsWith(mStr)&&p.status!=="cancelled").reduce((a,p)=>a+(Number(p.amount)||0),0);
+      const debt=Math.max(0,ch-pd);
+      return `<tr><td>${s.name}</td><td>${s.subject||""}</td><td style="text-align:right">${fmtM(s.price||0)} ₽</td><td style="text-align:right;color:${debt>0?"#c0392b":"#16a34a"}">${debt>0?fmtM(debt)+" ₽":"оплачено"}</td></tr>`;
+    }).join("");
+    const html=`<html><head><meta charset=utf-8><title>FizMat HQ — Сводка</title>
+      <style>body{font-family:-apple-system,Arial,sans-serif;max-width:760px;margin:24px auto;padding:20px;color:#18181b}
+      h1{font-size:22px;margin:0 0 4px}h2{font-size:15px;margin:24px 0 8px;color:#6c4ce0}
+      .sub{color:#888;font-size:12px;margin-bottom:16px}
+      table{width:100%;border-collapse:collapse;font-size:12px}
+      th{text-align:left;padding:6px 8px;border-bottom:2px solid #18181b;font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:#666}
+      td{padding:6px 8px;border-bottom:1px solid #eee}
+      .kpi{display:flex;gap:16px;margin:12px 0}.kpi div{flex:1;background:#f4f2fb;border-radius:10px;padding:12px}
+      .kpi b{display:block;font-size:20px}.kpi span{font-size:11px;color:#666}</style></head><body>
+      <h1>FizMat HQ — Сводка</h1>
+      <div class="sub">${new Date().toLocaleDateString("ru-RU",{day:"numeric",month:"long",year:"numeric"})} · ${MN[new Date().getMonth()]} ${new Date().getFullYear()}</div>
+      <div class="kpi">
+        <div><b>${students.length}</b><span>учеников</span></div>
+        <div><b>${fmtM(mInc)} ₽</b><span>доход месяца</span></div>
+        <div><b>${fmtM(mInc-mExp)} ₽</b><span>прибыль</span></div>
+        <div><b>${weekEv.filter(e=>e.type==="lesson").length}</b><span>уроков на неделе</span></div>
+      </div>
+      <h2>Расписание недели</h2>
+      <table><tr><th>День</th><th>Время</th><th>Событие</th><th>Предмет</th><th style="text-align:right">Сумма</th></tr>${rows||'<tr><td colspan=5 style="color:#999">Нет событий</td></tr>'}</table>
+      <h2>Ученики и оплата (${MN[new Date().getMonth()]})</h2>
+      <table><tr><th>Имя</th><th>Предмет</th><th style="text-align:right">Цена</th><th style="text-align:right">Долг</th></tr>${studRows||'<tr><td colspan=4 style="color:#999">Нет учеников</td></tr>'}</table>
+      </body></html>`;
+    const w=window.open("","_blank");
+    if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),300);}
+  }
+
+  function exportExcel(){
+    const mStr=localYM(new Date());
+    const esc=s=>String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;");
+    const sheet=(title,headers,rows)=>`<table border=1><tr><td colspan=${headers.length} style="font-weight:bold;font-size:14px">${title}</td></tr><tr>${headers.map(h=>`<th>${h}</th>`).join("")}</tr>${rows.map(r=>`<tr>${r.map(c=>`<td>${esc(c)}</td>`).join("")}</tr>`).join("")}</table><br/>`;
+    const studs=students.map(s=>{
+      const done=events.filter(e=>sameId(e.studentId,s.id)&&e.type==="lesson"&&e.status==="done").length;
+      const ch=done*(Number(s.price)||0);
+      const pd=payments.filter(p=>sameId(p.studentId,s.id)&&p.status!=="cancelled").reduce((a,p)=>a+(Number(p.amount)||0),0);
+      return [s.name,s.subject||"",s.grade||"",s.price||0,done,s.payMethod||"",Math.max(0,ch-pd)];
+    });
+    const evs=events.filter(e=>e.type==="lesson").sort((a,b)=>a.date>b.date?1:-1).map(e=>{const st=students.find(s=>sameId(s.id,e.studentId));return [e.date,e.time?.slice(0,5)||"",st?.name||e.title||"",e.status||"",e.price||st?.price||0];});
+    const fins=[...incomes.map(i=>[i.date,"Доход",i.type||"",i.amount||0]),...expenses.map(x=>[x.date,"Расход",x.category||"",-(x.amount||0)])].sort((a,b)=>a[0]>b[0]?1:-1);
+    const html=`<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel"><head><meta charset=utf-8></head><body>
+      ${sheet("УЧЕНИКИ",["Имя","Предмет","Класс","Цена","Уроков","Оплата","Долг"],studs)}
+      ${sheet("ЗАНЯТИЯ",["Дата","Время","Ученик","Статус","Сумма"],evs)}
+      ${sheet("ФИНАНСЫ",["Дата","Тип","Категория","Сумма"],fins)}
+      </body></html>`;
+    const blob=new Blob(["\ufeff"+html],{type:"application/vnd.ms-excel"});
+    const url=URL.createObjectURL(blob);const a=document.createElement("a");
+    a.href=url;a.download=`fizmat-hq-${today()}.xls`;a.click();URL.revokeObjectURL(url);
+  }
+
+  function impData(){
+    const inp=document.createElement("input");inp.type="file";inp.accept=".json";
+    inp.onchange=e=>{const f=e.target.files[0];if(!f)return;
+      const r=new FileReader();r.onload=ev=>{
+        try{const d=JSON.parse(ev.target.result);
+          if(d.events)setEvents(d.events);if(d.students)setStudents(d.students);
+          if(d.expenses)setExpenses(d.expenses);if(d.incomes)setIncomes(d.incomes);
+          if(d.tasks)setTasks(d.tasks);if(d.ideas)setIdeas(d.ideas);
+          if(d.projects)setProjects(d.projects);if(d.goals)setGoals(d.goals);
+          if(d.journal)setJournal(d.journal);if(d.kb)setKb(d.kb);
+          if(d.payments)setPayments(d.payments);
+          if(d.rls||d.recurringLessons)setRls(d.rls||d.recurringLessons);
+          if(d.excs||d.exceptions)setExcs(d.excs||d.exceptions);
+          if(d.brain)setBrain(d.brain);
+          if(d.offline)setOffline(d.offline);
+          if(d.expTpl)setExpTpl(d.expTpl);
+          if(d.lessonLog)setLessonLog(d.lessonLog);
+          try{ localStorage.setItem("fhq_last_export",String(Date.now())); }catch{}
+          if(gToken){
+            setSyncStatus("syncing");
+            setTimeout(()=>{
+              gSave(d)
+                .then(()=>{setSyncStatus("synced");alert("Данные импортированы и сохранены на Google Диск ✓");})
+                .catch(()=>{setSyncStatus("error");alert("Данные импортированы локально, но ошибка при сохранении в Drive. Войдите заново.");});
+            },300);
+          } else {
+            alert("Данные импортированы локально ✓\nЧтобы синхронизировать — войдите через Google на этой странице.");
+          }
+        }catch{alert("Ошибка файла");}
+      };r.readAsText(f);};inp.click();
+  }
+
+  function signOut(){
+    gToken=null;
+    gFileId=null;
+    setUser(undefined);
+    localStorage.removeItem("fhq_gdrive_choice");
+    localStorage.removeItem("fhq_gdrive_token");
+  }
+
+  // Отмена удаления: последнее удаление можно вернуть в течение 8 секунд.
+  const[undoItem,setUndoItem]=useState(null);
+  const undoTimerRef=useRef(null);
+  const pushUndo=useCallback((label,restore)=>{
+    setUndoItem({label,restore,key:Date.now()});
+    clearTimeout(undoTimerRef.current);
+    undoTimerRef.current=setTimeout(()=>setUndoItem(null),8000);
+  },[]);
+
+  // Очистка «фантомных» уроков: авто-проведённые повторяющиеся занятия, попавшие на
+  // даты РАНЬШЕ даты начала своего шаблона (последствие старого бага начислений).
+  function cleanPhantomLessons(){
+    const ph=(Array.isArray(events)?events:[]).filter(e=>{
+      if(!e||!e.recurringId)return false;
+      const rl=(Array.isArray(rls)?rls:[]).find(r=>r&&r.id===e.recurringId);
+      return rl&&rl.startDate&&e.date<rl.startDate;
+    });
+    if(ph.length===0){alert("Фантомных уроков не найдено — всё чисто.");return;}
+    if(!window.confirm("Найдено "+ph.length+" авто-начисленных уроков на даты раньше начала расписания.\n\nУдалить их? Долги пересчитаются. (можно отменить в течение 8 секунд)"))return;
+    const _pe=events;
+    const ids=new Set(ph.map(e=>e.id));
+    setEvents((Array.isArray(events)?events:[]).filter(e=>!ids.has(e.id)));
+    pushUndo("Очистка уроков",()=>setEvents(_pe));
+    alert("✓ Удалено "+ph.length+" лишних уроков.");
+  }
+
+  // Google Календарь — отправить уроки текущей недели (только добавление, с защитой от дублей).
+  async function pushWeekToGCal(){
+    try{
+      const pad=s=>{const p=String(s||"").split(":");return String(p[0]||"0").padStart(2,"0")+":"+String(p[1]||"00").padStart(2,"0");};
+      const wDates=getWeek(0), wS=iso(wDates[0]), wE=iso(wDates[6]);
+      const rec=genRec(rls,excs,students,wS,wE);
+      const weekLessons=[
+        ...events.filter(e=>e.type==="lesson"&&e.date>=wS&&e.date<=wE&&e.status!=="cancelled"),
+        ...rec.filter(r=>!events.some(e=>e.date===r.date&&e.time===r.time&&sameId(e.studentId,r.studentId)))
+      ];
+      let pushedArr=[]; try{pushedArr=JSON.parse(localStorage.getItem("fhq_gcal_pushed")||"[]");}catch(_){pushedArr=[];}
+      const pushedSet=new Set(pushedArr);
+      const tz=(Intl.DateTimeFormat().resolvedOptions().timeZone)||"Europe/Moscow";
+      let created=0, skipped=0, failed=0;
+      for(const e of weekLessons){
+        const st=students.find(s=>sameId(s.id,e.studentId));
+        const time=pad(e.time||"10:00");
+        const key=e.date+"T"+time+"|"+(e.studentId||"");
+        if(pushedSet.has(key)){skipped++;continue;}
+        const end=pad(addMin(time,Number(e.duration)||60));
+        const body={
+          summary:(e.title||st?.name||"Урок")+(st?.subject?" · "+st.subject:""),
+          description:"FizMat HQ"+(st?.grade?" · "+st.grade+" класс":""),
+          start:{dateTime:e.date+"T"+time+":00",timeZone:tz},
+          end:{dateTime:e.date+"T"+end+":00",timeZone:tz}
+        };
+        const res=await gcalFetch("https://www.googleapis.com/calendar/v3/calendars/primary/events",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+        if(res.ok){created++; pushedSet.add(key);} else {failed++;}
+      }
+      localStorage.setItem("fhq_gcal_pushed",JSON.stringify([...pushedSet]));
+      alert("Google Календарь: добавлено "+created+", пропущено (уже были) "+skipped+(failed?(", ошибок "+failed):"")+".");
+    }catch(e){ alert("Ошибка отправки в Google Календарь: "+(e&&e.message||e)); }
+  }
+
+  // Google Календарь — загрузить события (±6 недель) как обычные события (только добавление).
+  async function pullFromGCal(){
+    try{
+      const now=new Date();
+      const tMin=new Date(now); tMin.setDate(tMin.getDate()-14);
+      const tMax=new Date(now); tMax.setDate(tMax.getDate()+42);
+      const url="https://www.googleapis.com/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&maxResults=250&timeMin="+encodeURIComponent(tMin.toISOString())+"&timeMax="+encodeURIComponent(tMax.toISOString());
+      const res=await gcalFetch(url,{method:"GET"});
+      if(!res.ok){ alert("Не удалось загрузить из Google Календаря (код "+res.status+"). Проверьте, что включён Calendar API."); return; }
+      const data=await res.json();
+      const items=Array.isArray(data.items)?data.items:[];
+      let impArr=[]; try{impArr=JSON.parse(localStorage.getItem("fhq_gcal_imported")||"[]");}catch(_){impArr=[];}
+      const impSet=new Set(impArr);
+      const existingGids=new Set((Array.isArray(events)?events:[]).map(e=>e.gcalId).filter(Boolean));
+      const toAdd=[];
+      for(const g of items){
+        if(!g||!g.id||g.status==="cancelled")continue;
+        if(impSet.has(g.id)||existingGids.has(g.id))continue;
+        const s=g.start&&(g.start.dateTime||g.start.date);
+        if(!s)continue;
+        const allDay=!(g.start&&g.start.dateTime);
+        const dt=new Date(s);
+        if(isNaN(dt))continue;
+        const date=iso(dt);
+        const time=allDay?"":(String(dt.getHours()).padStart(2,"0")+":"+String(dt.getMinutes()).padStart(2,"0"));
+        let dur=60;
+        if(g.end&&g.end.dateTime&&g.start.dateTime){ dur=Math.max(15,Math.round((new Date(g.end.dateTime)-new Date(g.start.dateTime))/60000)); }
+        toAdd.push({id:"g_"+g.id,gcalId:g.id,title:g.summary||"Событие",type:"other",date,time,duration:dur,status:"planned",allDay});
+        impSet.add(g.id);
+      }
+      if(toAdd.length===0){ alert("Новых событий в Google Календаре не найдено."); return; }
+      const _pe=events;
+      setEvents([...(Array.isArray(events)?events:[]),...toAdd]);
+      pushUndo("Импорт из календаря",()=>setEvents(_pe));
+      localStorage.setItem("fhq_gcal_imported",JSON.stringify([...impSet]));
+      alert("Импортировано "+toAdd.length+" событий из Google Календаря.");
+    }catch(e){ alert("Ошибка загрузки из Google Календаря: "+(e&&e.message||e)); }
+  }
+
+  // Миграция: у старых шаблонов расписания не было даты начала, из-за чего они
+  // «задним числом» начисляли уроки за прошлые недели. Проставляем им сегодня.
+  // Идемпотентно: как только у всех шаблонов есть startDate, эффект ничего не делает.
+  useEffect(()=>{
+    if(Array.isArray(rls)&&rls.some(r=>r&&!r.startDate)){
+      setRls(prev=>(Array.isArray(prev)?prev:[]).map(r=>(r&&!r.startDate)?{...r,startDate:today()}:r));
+    }
+  },[rls]);
+
+  // Напоминание о резервной копии, если её давно не делали и данные есть.
+  useEffect(()=>{
+    try{
+      const last=Number(localStorage.getItem("fhq_last_export")||0);
+      const days=(Date.now()-last)/86400000;
+      const hasData=(students&&students.length)||(events&&events.length);
+      const isGoogle=user&&user.type==="google";
+      if(hasData && !isGoogle && (!last || days>=7) && !document.getElementById("fhq-backup-nudge")){
+        const bar=document.createElement("div");
+        bar.id="fhq-backup-nudge";
+        bar.style.cssText="position:fixed;left:12px;right:12px;bottom:12px;max-width:520px;margin:0 auto;background:#1C1C1E;color:#fff;padding:12px 14px;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.25);font-size:13px;z-index:9998;display:flex;gap:12px;align-items:center;justify-content:space-between";
+        const txt=document.createElement("span");
+        txt.textContent=last?"Давно не делали резервную копию. Сохраните данные на всякий случай.":"Совет: сохраните резервную копию данных — на случай очистки браузера.";
+        const wrap=document.createElement("div");wrap.style.cssText="display:flex;gap:8px;flex-shrink:0";
+        const b1=document.createElement("button");b1.textContent="Экспорт";b1.style.cssText="padding:6px 12px;border-radius:8px;border:none;background:#2C5EE8;color:#fff;font-weight:600;cursor:pointer;font-size:12px";
+        b1.onclick=()=>{ try{ expData(); }catch{} };
+        const b2=document.createElement("button");b2.textContent="Позже";b2.style.cssText="padding:6px 12px;border-radius:8px;border:1px solid rgba(255,255,255,.2);background:transparent;color:#fff;cursor:pointer;font-size:12px";
+        b2.onclick=()=>bar.remove();
+        wrap.appendChild(b1);wrap.appendChild(b2);bar.appendChild(txt);bar.appendChild(wrap);
+        document.body.appendChild(bar);
+      }
+    }catch{}
+  },[students,events,user]);
+
+  const store={events,setEvents,students,setStudents,expenses,setExpenses,incomes,setIncomes,
+    tasks,setTasks,ideas,setIdeas,projects,setProjects,goals,setGoals,journal,setJournal,
+    kb,setKb,offline,setOffline,payments,setPayments,rls,setRls,excs,setExcs,brain,setBrain,expTpl,setExpTpl,lessonLog,setLessonLog,quickLog,setQuickLog,homeTiles,setHomeTiles,pageStyles,setPageStyles,autoComplete,pushUndo};
+
+  const overdueCount=tasks.filter(t=>t.status!=="done"&&t.deadline&&t.deadline<today()).length;
+  const pendPayCount=useMemo(()=>{
+    const mStr=localYM(new Date());
+    return students.filter(s=>{
+      const ch=events.filter(e=>e.studentId===s.id&&e.date.startsWith(mStr)&&e.type==="lesson"&&e.status==="done").length*(Number(s.price)||0);
+      const pd=payments.filter(p=>p.studentId===s.id&&p.date?.startsWith(mStr)&&p.status!=="cancelled").reduce((a,p)=>a+(Number(p.amount)||0),0);
+      return ch-pd>0;
+    }).length;
+  },[students,events,payments]);
+
+  const NAV=[
+    {g:"",items:[
+      {id:"home",icon:"◻",label:"Главная"},
+      {id:"week",icon:"◫",label:"Моя неделя"},
+    ]},
+    {g:"Работа",items:[
+      {id:"calendar",icon:"▦",label:"Календарь"},
+      {id:"schedule",icon:"↻",label:"Расписание"},
+      {id:"students",icon:"◉",label:"Ученики"},
+    ]},
+    {g:"Финансы",items:[
+      {id:"finance",icon:"◈",label:"Финансы"},
+      {id:"payments",icon:"◇",label:"Платежи",badge:pendPayCount},
+    ]},
+    {g:"Задачи",items:[
+      {id:"tasks",icon:"◻",label:"Задачи",badge:overdueCount},
+      {id:"projects",icon:"◆",label:"Проекты"},
+    ]},
+    {g:"База знаний",items:[
+      {id:"brain",icon:"◎",label:"Второй мозг"},
+      {id:"kb",icon:"▣",label:"База знаний"},
+      {id:"journal",icon:"◑",label:"Журнал"},
+    ]},
+    {g:"Итоги",items:[
+      {id:"stats",icon:"▲",label:"Аналитика"},
+      {id:"goals",icon:"◌",label:"Цели"},
+    ]},
+  ];
+
+  const ALLNAV=[
+    {id:"home",icon:"⬡",label:"Сводка"},
+    {id:"calendar",icon:"▦",label:"Календарь"},
+    {id:"students",icon:"◉",label:"Ученики"},
+    {id:"payments",icon:"◇",label:"Платежи",badge:pendPayCount},
+    {id:"finance",icon:"◈",label:"Финансы"},
+    {id:"week",icon:"◫",label:"Моя неделя"},
+    {id:"schedule",icon:"↻",label:"Расписание"},
+    {id:"tasks",icon:"✓",label:"Задачи",badge:overdueCount},
+    {id:"projects",icon:"◆",label:"Проекты"},
+    {id:"brain",icon:"✦",label:"Заметки"},
+    {id:"kb",icon:"❑",label:"База знаний"},
+    {id:"stats",icon:"▲",label:"Аналитика"},
+    {id:"goals",icon:"◎",label:"Цели"},
+  ];
+  const defaultOrder=["home","calendar","students","payments","finance","week","schedule","tasks","projects","brain","kb","stats","goals"];
+  const order=(Array.isArray(dockOrder)&&dockOrder.length?dockOrder:defaultOrder)
+    .filter(id=>ALLNAV.some(n=>n.id===id));
+  ALLNAV.forEach(n=>{if(!order.includes(n.id))order.push(n.id);});
+  const navById=id=>ALLNAV.find(n=>n.id===id);
+  const DOCK=order.slice(0,5).map(navById);
+  const MORE=order.slice(5).map(navById);
+
+  const PAGES={
+    home:<Home store={store} setTab={setTab}/>,
+    week:<WeekView store={store}/>,
+    calendar:<CalPage store={store} openNew={calModal} onOpenNew={()=>setCalModal(false)}/>,
+    schedule:<RecurringPage store={store}/>,
+    students:<StudentsPage store={store}/>,
+    finance:<FinancePage store={store}/>,
+    payments:<PaymentsPage store={store}/>,
+    tasks:<TasksPage store={store}/>,
+    projects:<ProjectsPage store={store}/>,
+    brain:<BrainPage store={store}/>,
+    kb:<KBPage store={store}/>,
+    journal:<JournalPage store={store}/>,
+    stats:<StatsPage store={store}/>,
+    goals:<GoalsPage store={store}/>,
+  };
+
+  const now=new Date();
+
+  if(user===undefined&&GDRIVE_CLIENT_ID!=="YOUR_GOOGLE_CLIENT_ID") {
+    return <AuthScreen onAuth={u=>{
+      if(u===null){
+        localStorage.setItem("fhq_gdrive_choice","local");
+        setUser(null);
+      } else {
+        localStorage.setItem("fhq_gdrive_choice","google");
+        localStorage.setItem("fhq_gdrive_token",u.token);
+        gToken=u.token;
+        setUser(u);
+      }
+    }}/>;
+  }
+
+  return(
+    <div style={{display:"flex",height:"100vh",overflow:"hidden",background:T.bg}}>
+      {/* Sidebar — desktop only */}
+      <div className="desktop-sidebar" style={{
+        width:220,background:"var(--sidebar-bg)",
+        display:"flex",flexDirection:"column",flexShrink:0,
+        overflowY:"auto",borderRight:"none"
+      }}>
+        <div style={{padding:"20px 18px 16px",display:"flex",alignItems:"center",gap:10}}>
+          <div style={{
+            width:32,height:32,
+            background:"linear-gradient(135deg,#2563EB,#7C3AED)",
+            borderRadius:10,display:"flex",alignItems:"center",justifyContent:"center",
+            fontSize:13,fontWeight:800,color:"#fff",letterSpacing:"-0.02em",flexShrink:0,
+            boxShadow:"0 4px 16px rgba(44,94,232,0.4)"
+          }}>F</div>
+          <div>
+            <div style={{fontSize:14,fontWeight:800,color:"#fff",letterSpacing:"-0.04em",lineHeight:1}}>FizMat HQ</div>
+            <div style={{fontSize:10,color:"var(--sidebar-muted)",marginTop:2,fontWeight:400}}>Персональный штаб</div>
+          </div>
+        </div>
+
+        <div style={{height:1,background:"rgba(255,255,255,0.06)",margin:"0 14px 8px"}}/>
+
+        <nav style={{flex:1,padding:"4px 10px",overflowY:"auto"}}>
+          {NAV.map((group,gi)=>(
+            <div key={gi} style={{marginBottom:6}}>
+              {group.g&&(
+                <div style={{
+                  fontSize:9,fontWeight:700,
+                  color:"var(--sidebar-muted)",
+                  letterSpacing:"0.08em",textTransform:"uppercase",
+                  padding:"8px 8px 3px"
+                }}>{group.g}</div>
+              )}
+              {group.items.map(n=>{
+                const active=tab===n.id;
+                return(
+                  <div key={n.id}
+                    className="nav-item"
+                    onClick={()=>setTab(n.id)}
+                    style={{
+                      display:"flex",alignItems:"center",justifyContent:"space-between",
+                      padding:"7px 9px",borderRadius:9,cursor:"pointer",marginBottom:1,
+                      background:active?"var(--sidebar-active)":"transparent",
+                      color:active?"var(--sidebar-active-txt)":"var(--sidebar-text)",
+                      fontWeight:active?600:400,fontSize:13,
+                      transition:"all 0.12s ease"
+                    }}
+                  >
+                    <div style={{display:"flex",alignItems:"center",gap:8}}>
+                      <span style={{
+                        fontSize:11,width:16,textAlign:"center",flexShrink:0,
+                        fontWeight:400,color:active?"#fff":"var(--sidebar-muted)"
+                      }}>{n.icon}</span>
+                      <span style={{letterSpacing:"-0.01em"}}>{n.label}</span>
+                    </div>
+                    {n.badge>0&&(
+                      <span style={{
+                        background:T.red,color:"#fff",borderRadius:99,
+                        fontSize:10,fontWeight:700,padding:"1px 6px",minWidth:18,textAlign:"center"
+                      }}>{n.badge}</span>
+                    )}
+                    {active&&(
+                      <div style={{width:3,height:16,borderRadius:99,background:T.accent,position:"absolute",right:0}}/>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </nav>
+
+        <div style={{height:1,background:"rgba(255,255,255,0.06)",margin:"0 14px"}}/>
+        <div style={{padding:"10px 12px 14px"}}>
+          <div style={{display:"flex",gap:4,marginBottom:5}}>
+            <button onClick={expData} style={{flex:1,background:"rgba(255,255,255,0.06)",border:"none",borderRadius:7,padding:"6px 8px",cursor:"pointer",fontSize:10,color:"var(--sidebar-muted)",fontWeight:500,fontFamily:"var(--font)"}}>Экспорт</button>
+            <button onClick={impData} style={{flex:1,background:"rgba(255,255,255,0.06)",border:"none",borderRadius:7,padding:"6px 8px",cursor:"pointer",fontSize:10,color:"var(--sidebar-muted)",fontWeight:500,fontFamily:"var(--font)"}}>Импорт</button>
+          </div>
+          <button onClick={()=>setSettingsOpen(true)} style={{width:"100%",background:"rgba(255,255,255,0.06)",border:"none",borderRadius:7,padding:"6px 8px",cursor:"pointer",fontSize:10,color:"var(--sidebar-muted)",fontWeight:500,fontFamily:"var(--font)",marginBottom:5}}>⚙ Настройки и данные</button>
+          {user&&user.type==="google"?(
+            <div>
+              <button onClick={()=>{
+                if(!gToken){alert("Войдите через Google.");return;}
+                setSyncStatus("syncing");
+                gSave({events,students,expenses,incomes,tasks,payments,rls,excs,brain,kb,journal,projects,goals,ideas,offline,expTpl,lessonLog,dockOrder,homeTiles,pageStyles,_savedAt:new Date().toISOString()}).then(()=>{gFileId=null;setSyncStatus("synced");}).catch(()=>setSyncStatus("error"));
+              }} style={{width:"100%",background:"rgba(37,99,235,0.25)",border:"1px solid rgba(37,99,235,0.4)",borderRadius:7,padding:"6px 8px",cursor:"pointer",fontSize:10,color:"#93C5FD",fontWeight:600,fontFamily:"var(--font)"}}>↑ Сохранить на Drive</button>
+              <div style={{fontSize:9,color:"var(--sidebar-muted)",textAlign:"center",marginTop:4}}>{syncStatus==="synced"?"✓ синхронизировано":syncStatus==="syncing"?"⟳ сохранение...":syncStatus==="error"?"✗ ошибка":"● Google Drive"}</div>
+            </div>
+          ):(
+            <div style={{fontSize:9,color:"var(--sidebar-muted)",textAlign:"center",letterSpacing:"0.02em"}}>данные хранятся локально</div>
+          )}
+        </div>
+      </div>
+
+      {/* Main area */}
+      <div style={{flex:1,overflowY:"auto",display:"flex",flexDirection:"column",minWidth:0,background:T.bg}}>
+        {/* Topbar */}
+        <div className="desktop-topbar" style={{
+          background:"var(--topbar)",
+          backdropFilter:"blur(20px)",
+          borderBottom:`1px solid ${T.border}`,
+          padding:"0 24px",
+          display:"flex",alignItems:"center",gap:12,
+          position:"sticky",top:0,zIndex:100,height:52,flexShrink:0
+        }}>
+          <div style={{flex:1,position:"relative",maxWidth:340}}>
+            <span style={{
+              position:"absolute",left:11,top:"50%",transform:"translateY(-50%)",
+              color:T.t3,fontSize:13,pointerEvents:"none",fontWeight:400
+            }}>⌕</span>
+            <input
+              ref={sRef}
+              value={sq}
+              onChange={e=>{setSq(e.target.value);setShowSearch(true);}}
+              onFocus={()=>setShowSearch(true)}
+              placeholder="Поиск...  ⌘K"
+              style={{
+                width:"100%",border:`1px solid ${T.border}`,borderRadius:10,
+                padding:"7px 12px 7px 32px",fontSize:13,outline:"none",
+                background:T.surface2,color:T.text,
+                boxShadow:T.shadow,transition:"all 0.15s"
+              }}
+            />
+            {showSearch&&sq&&sRes.length>0&&(
+              <div style={{
+                position:"absolute",top:"110%",left:0,width:"100%",
+                background:T.surface,borderRadius:12,boxShadow:T.shadowLg,
+                zIndex:500,border:`1px solid ${T.border}`,overflow:"hidden"
+              }}>
+                {sRes.map((r,i)=>(
+                  <div key={i}
+                    onClick={()=>{setTab(r.tab);setSq("");setShowSearch(false);}}
+                    style={{padding:"9px 13px",cursor:"pointer",borderBottom:`1px solid ${T.border2}`,display:"flex",gap:10,alignItems:"center",transition:"background 0.08s"}}
+                    onMouseEnter={e=>e.currentTarget.style.background=T.surface2}
+                    onMouseLeave={e=>e.currentTarget.style.background=""}
+                  >
+                    <Badge color={T.accent} size="sm">{r.type}</Badge>
+                    <span style={{fontSize:13,color:T.text}}>{r.title}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div style={{fontSize:12,color:T.t3,fontWeight:500,letterSpacing:"-0.01em"}}>
+            {now.toLocaleDateString("ru-RU",{weekday:"short",day:"numeric",month:"long"})}
+          </div>
+
+          {user&&user.type==="google"&&<SyncBadge status={syncStatus}/>}
+
+          <button onClick={()=>setSettingsOpen(true)} style={{background:T.surface2,border:`1px solid ${T.border}`,borderRadius:9,padding:"6px 10px",cursor:"pointer",fontSize:13,color:T.t2,fontFamily:"var(--font)",display:"flex",alignItems:"center"}}>⚙</button>
+
+          <button
+            onClick={()=>setDark(d=>!d)}
+            style={{
+              background:T.surface2,border:`1px solid ${T.border}`,
+              borderRadius:9,padding:"6px 10px",cursor:"pointer",
+              fontSize:13,lineHeight:1,transition:"all 0.15s",
+              boxShadow:T.shadow
+            }}
+          >
+            {dark?"☀":"●"}
+          </button>
+
+          {user&&user.type==="google"&&(
+            <button onClick={signOut} title="Выйти из аккаунта"
+              style={{background:T.surface2,border:`1px solid ${T.border}`,borderRadius:9,padding:"6px 10px",cursor:"pointer",fontSize:11,color:T.t2,fontFamily:"var(--font)"}}>
+              Выйти
+            </button>
+          )}
+        </div>
+
+        {/* Mobile header */}
+        <div className="mobile-header" style={{
+          position:"sticky",top:0,zIndex:100,flexShrink:0,
+          background:"var(--topbar)",backdropFilter:"blur(20px)",
+          borderBottom:`1px solid ${T.border}`,
+          padding:"12px 16px",display:"none",alignItems:"center",justifyContent:"space-between"
+        }}>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <div style={{width:28,height:28,background:"linear-gradient(135deg,#2563EB,#7C3AED)",borderRadius:8,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:900,color:"#fff"}}>F</div>
+            <div style={{fontSize:15,fontWeight:800,letterSpacing:"-0.04em"}}>{NAV.flatMap(g=>g.items).find(n=>n.id===tab)?.label||"FizMat HQ"}</div>
+          </div>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            {user&&user.type==="google"&&<SyncBadge status={syncStatus}/>}
+            <button onClick={()=>setSettingsOpen(true)} title="Настройки и аккаунт" style={{background:"var(--surface2)",border:`1px solid ${T.border}`,borderRadius:7,width:30,height:30,cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",justifyContent:"center"}}>⚙</button>
+            <button onClick={()=>setDark(d=>!d)} style={{background:"var(--surface2)",border:`1px solid ${T.border}`,borderRadius:7,width:30,height:30,cursor:"pointer",fontSize:13,display:"flex",alignItems:"center",justifyContent:"center"}}>{dark?"☀":"●"}</button>
+          </div>
+        </div>
+
+        <div className="mobile-page" style={{flex:1,padding:"22px 24px"}} onClick={()=>setShowSearch(false)}>
+          <div key={tab} className="pg-enter">{PAGES[tab]||<div/>}</div>
+        </div>
+      </div>
+
+      {/* Bottom Navigation — mobile only */}
+      <nav className="bottom-nav" style={{
+        display:"none",justifyContent:"space-around",alignItems:"center"
+      }}>
+        {[
+          {id:"home",icon:"⌂",label:"Главная"},
+          {id:"calendar",icon:"▦",label:"Календарь"},
+          {id:"students",icon:"◉",label:"Ученики"},
+          {id:"payments",icon:"◇",label:"Деньги"},
+          {id:"_more",icon:"≡",label:"Ещё"},
+        ].map(n=>{
+          const active=n.id!=="home"?tab===n.id:tab==="home"||tab==="week";
+          const isMore=n.id==="_more";
+          return(
+            <button key={n.id} onClick={()=>isMore?setTab("stats"):setTab(n.id)}
+              style={{
+                background:"none",border:"none",cursor:"pointer",
+                display:"flex",flexDirection:"column",alignItems:"center",gap:2,
+                padding:"4px 10px",
+                color:active?"#fff":"var(--sidebar-muted)",
+                fontFamily:"var(--font)",minWidth:56,position:"relative",
+                transition:"color 0.12s"
+              }}>
+              {n.id==="payments"&&pendPayCount>0&&(
+                <span style={{position:"absolute",top:0,right:4,background:"var(--red)",color:"#fff",borderRadius:99,fontSize:8,fontWeight:700,padding:"1px 4px",lineHeight:1.4}}>{pendPayCount}</span>
+              )}
+              <span style={{fontSize:18,lineHeight:1}}>{n.icon}</span>
+              <span style={{fontSize:9,fontWeight:active?700:400,letterSpacing:"0.01em"}}>{n.label}</span>
+              {active&&<div style={{position:"absolute",bottom:-3,width:16,height:2,borderRadius:99,background:T.accent}}/>}
+            </button>
+          );
+        })}
+      </nav>
+
+      {/* Отмена удаления */}
+      {undoItem&&(
+        <div style={{position:"fixed",left:"50%",transform:"translateX(-50%)",bottom:"calc(env(safe-area-inset-bottom, 0px) + 78px)",zIndex:9999,background:"#1C1C1E",color:"#fff",borderRadius:12,padding:"10px 14px",display:"flex",alignItems:"center",gap:14,boxShadow:"0 10px 40px rgba(0,0,0,.35)",maxWidth:"92vw",fontSize:13}}>
+          <span>«{undoItem.label}» удалён</span>
+          <button onClick={()=>{try{undoItem.restore();}catch(_){} setUndoItem(null);}} style={{background:"#2C5EE8",border:"none",color:"#fff",fontWeight:700,borderRadius:8,padding:"6px 12px",cursor:"pointer",fontSize:12,fontFamily:"var(--font)"}}>Отменить</button>
+        </div>
+      )}
+
+      {/* Command Palette */}
+      {palOpen&&(
+        <div
+          onClick={()=>setPalOpen(false)}
+          style={{position:"fixed",inset:0,background:"var(--modal-bg)",zIndex:600,
+            display:"flex",alignItems:"flex-start",justifyContent:"center",paddingTop:80,backdropFilter:"blur(8px)"}}
+        >
+          <div
+            onClick={e=>e.stopPropagation()}
+            style={{
+              background:T.surface,borderRadius:16,width:"100%",maxWidth:520,
+              border:`1px solid ${T.border}`,overflow:"hidden",
+              boxShadow:"0 24px 64px rgba(0,0,0,0.2)"
+            }}
+          >
+            <div style={{display:"flex",alignItems:"center",padding:"14px 18px",borderBottom:`1px solid ${T.border}`,gap:10}}>
+              <span style={{fontSize:15,color:T.t3}}>⌕</span>
+              <input autoFocus value={sq} onChange={e=>setSq(e.target.value)}
+                placeholder="Найти или перейти..."
+                style={{flex:1,border:"none",fontSize:15,outline:"none",background:"transparent",color:T.text}}/>
+              <span style={{fontSize:10,color:T.t3,background:T.surface2,padding:"2px 6px",borderRadius:5}}>Esc</span>
+            </div>
+            <div style={{maxHeight:320,overflowY:"auto"}}>
+              {NAV.flatMap(g=>g.items).filter(n=>!sq||n.label.toLowerCase().includes(sq.toLowerCase())).map(n=>(
+                <div key={n.id}
+                  onClick={()=>{setTab(n.id);setPalOpen(false);setSq("");}}
+                  style={{
+                    padding:"11px 18px",cursor:"pointer",
+                    borderBottom:`1px solid ${T.border2}`,
+                    display:"flex",gap:12,alignItems:"center"
+                  }}
+                  onMouseEnter={e=>e.currentTarget.style.background=T.surface2}
+                  onMouseLeave={e=>e.currentTarget.style.background=""}
+                >
+                  <span style={{fontSize:13,color:T.t3,width:18,textAlign:"center"}}>{n.icon}</span>
+                  <span style={{fontSize:14,color:T.text,fontWeight:500}}>{n.label}</span>
+                </div>
+              ))}
+              {sRes.map((r,i)=>(
+                <div key={`s${i}`}
+                  onClick={()=>{setTab(r.tab);setPalOpen(false);setSq("");}}
+                  style={{
+                    padding:"11px 18px",cursor:"pointer",
+                    borderBottom:`1px solid ${T.border2}`,
+                    display:"flex",gap:10,alignItems:"center"
+                  }}
+                  onMouseEnter={e=>e.currentTarget.style.background=T.surface2}
+                  onMouseLeave={e=>e.currentTarget.style.background=""}
+                >
+                  <Badge color={T.accent2} size="sm">{r.type}</Badge>
+                  <span style={{fontSize:14}}>{r.title}</span>
+                </div>
+              ))}
+            </div>
+            <div style={{padding:"8px 18px",fontSize:11,color:T.t3,borderTop:`1px solid ${T.border2}`,display:"flex",gap:16}}>
+              <span>↑↓ навигация</span><span>↵ открыть</span><span>C — новое событие</span><span>H — главная</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {settingsOpen&&(
+        <Modal title="Настройки и данные" onClose={()=>setSettingsOpen(false)}>
+          <div style={{marginBottom:18}}>
+            <div style={{fontSize:11,fontWeight:800,color:T.t3,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:8}}>Оформление</div>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 0"}}>
+              <span style={{fontSize:13,fontWeight:600}}>Тёмная тема</span>
+              <div className="toggle-wrap" onClick={()=>setDark(d=>!d)}>
+                <div className={`toggle-track${dark?" on":""}`}><div className={`toggle-thumb${dark?" on":""}`}/></div>
+              </div>
+            </div>
+            <div style={{marginTop:6,padding:"8px 0"}}>
+              <div style={{fontSize:13,fontWeight:600,marginBottom:8}}>Акцентный цвет</div>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                {[["violet","#2C5EE8"],["mint","#16C79A"],["coral","#FF5D3B"],["amber","#FFB627"],["pink","#FF4D8D"]].map(([name,hex])=>(
+                  <button key={name} onClick={()=>{document.documentElement.style.setProperty("--accent",hex);setPageStyles({...pageStyles,accent:hex});}}
+                    style={{width:30,height:30,borderRadius:9,background:hex,border:(pageStyles.accent===hex||(!pageStyles.accent&&name==="violet"))?`3px solid ${T.text}`:`2px solid ${T.border}`,cursor:"pointer",padding:0}}/>
+                ))}
+              </div>
+              <div style={{fontSize:10.5,color:T.t3,marginTop:6}}>Меняет основной цвет кнопок и акцентов</div>
+            </div>
+          </div>
+
+          <div style={{marginBottom:18}}>
+            <div style={{fontSize:11,fontWeight:800,color:T.t3,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:8}}>Аккаунт</div>
+            <div className="tile-flat" style={{padding:"12px 14px",display:"flex",alignItems:"center",gap:10,background:T.surface2,borderRadius:10,border:`1px solid ${T.border}`}}>
+              <div style={{width:34,height:34,borderRadius:9,background:user&&user.type==="google"?"var(--green)":"var(--surface2)",border:`2px solid ${T.border}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:15}}>{user&&user.type==="google"?"☁":"○"}</div>
+              <div style={{flex:1}}>
+                <div style={{fontSize:13,fontWeight:700}}>{user&&user.type==="google"?"Google Диск подключён":"Локальный режим"}</div>
+                <div style={{fontSize:11,color:T.t2}}>{user&&user.type==="google"?"Данные синхронизируются":"Данные только на этом устройстве"}</div>
+              </div>
+            </div>
+            {user&&user.type==="google"?(
+              <Btn variant="secondary" size="sm" style={{marginTop:8,width:"100%"}} onClick={()=>{setSettingsOpen(false);signOut();}}>Выйти из аккаунта</Btn>
+            ):(
+              <Btn size="sm" style={{marginTop:8,width:"100%"}} onClick={async()=>{
+                try{const token=await gAuth();gToken=token;localStorage.setItem("fhq_gdrive_token",token);localStorage.setItem("fhq_gdrive_choice","google");setUser({type:"google",token});setSettingsOpen(false);}
+                catch(e){alert("Ошибка входа: "+e.message);}
+              }}>Войти через Google</Btn>
+            )}
+          </div>
+
+          <div style={{marginBottom:18}}>
+            <div style={{fontSize:11,fontWeight:800,color:T.t3,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:8}}>Резервная копия</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+              <Btn variant="secondary" size="sm" onClick={()=>{expData();}}>⬇ Экспорт JSON</Btn>
+              <Btn variant="secondary" size="sm" onClick={()=>{impData();setSettingsOpen(false);}}>⬆ Импорт JSON</Btn>
+            </div>
+            <div style={{fontSize:10.5,color:T.t3,marginTop:6,lineHeight:1.4}}>JSON — полная копия всех данных. Импорт заменяет текущие данные.</div>
+          </div>
+
+          <div style={{marginBottom:18}}>
+            <div style={{fontSize:11,fontWeight:800,color:T.t3,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:8}}>Обслуживание</div>
+            <Btn variant="secondary" size="sm" style={{width:"100%"}} onClick={()=>{cleanPhantomLessons();}}>🧹 Очистить лишние авто-уроки</Btn>
+            <div style={{fontSize:10.5,color:T.t3,marginTop:6,lineHeight:1.4}}>Удаляет автоматически начисленные уроки на даты раньше начала их расписания (последствие старого бага). Долги пересчитаются. Можно отменить.</div>
+          </div>
+
+          <div style={{marginBottom:18}}>
+            <div style={{fontSize:11,fontWeight:800,color:T.t3,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:8,display:"flex",alignItems:"center",gap:8}}>Google Календарь <span style={{fontSize:9,fontWeight:700,color:T.amber,background:"#FFFBEB",border:`1px solid ${T.border}`,borderRadius:6,padding:"1px 6px",letterSpacing:0}}>бета</span></div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+              <Btn variant="secondary" size="sm" onClick={()=>{gCalAuth(true).then(()=>pushWeekToGCal()).catch(e=>alert("Ошибка доступа к календарю: "+(e&&e.message||e)));}}>↑ Отправить неделю</Btn>
+              <Btn variant="secondary" size="sm" onClick={()=>{gCalAuth(true).then(()=>pullFromGCal()).catch(e=>alert("Ошибка доступа к календарю: "+(e&&e.message||e)));}}>↓ Загрузить события</Btn>
+            </div>
+            <div style={{fontSize:10.5,color:T.t3,marginTop:6,lineHeight:1.4}}>Обмен вручную и только добавление — ничего не удаляется (максимум дубликат). «Отправить неделю» создаёт уроки текущей недели в вашем календаре (с защитой от повторов), «Загрузить» переносит события календаря (±6 недель) в приложение как обычные события. Нужен включённый Google Calendar API в вашем OAuth-проекте; при первом запуске Google попросит доступ к календарю. Полностью автоматическую двустороннюю синхронизацию можно добавить позже.</div>
+          </div>
+
+          <div>
+            <div style={{fontSize:11,fontWeight:800,color:T.t3,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:8}}>Отчёты и выгрузка</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+              <Btn variant="secondary" size="sm" onClick={()=>{exportPDF();}}>📄 Сводка PDF</Btn>
+              <Btn variant="secondary" size="sm" onClick={()=>{exportExcel();}}>📊 Excel (.xls)</Btn>
+            </div>
+            <div style={{fontSize:10.5,color:T.t3,marginTop:6,lineHeight:1.4}}>PDF — расписание недели + ученики + финансы. Excel — таблицы учеников, занятий и финансов.</div>
+          </div>
+        </Modal>
+      )}
+      {quickLog&&<QuickLogModal store={store} onClose={()=>setQuickLog(null)}/>}
+    </div>
+  );
+}
+/* ──────────────────────────────────────────────────────────────
+   APP (уже определён выше) — он использует все страницы.
+───────────────────────────────────────────────────────────── */
+
+/* ── ГРАНИЦА ОШИБОК ────────────────────────────────────────────
+   Ловит краши рендера: вместо белого экрана — экран с кнопками
+   «скачать резервную копию» (читает прямо из localStorage) и
+   «перезагрузить». Данные не теряются. */
+class ErrorBoundary extends React.Component{
+  constructor(p){ super(p); this.state={err:null}; }
+  static getDerivedStateFromError(err){ return {err}; }
+  componentDidCatch(err,info){ console.error("App crashed:",err,info); }
+  rescue(){
+    try{
+      const keys=["lhq_events","lhq_students","lhq_expenses","lhq_incomes","lhq_tasks","lhq_ideas","lhq_projects","lhq_goals","lhq_journal","lhq_kb","lhq_offline","lhq_payments","lhq_recurring","lhq_exceptions","lhq_brain","lhq_exptpl","lhq_lessonlog","fhq_dockorder","fhq_hometiles","fhq_pagestyles"];
+      const d={_exported:new Date().toISOString(),_rescue:true};
+      keys.forEach(k=>{ try{ const v=localStorage.getItem(k); if(v!=null) d[k.replace(/^lhq_|^fhq_/,"")]=JSON.parse(v); }catch{} });
+      const b=new Blob([JSON.stringify(d,null,2)],{type:"application/json"});
+      const a=document.createElement("a"); a.href=URL.createObjectURL(b);
+      a.download="fizmat_rescue_"+new Date().toISOString().slice(0,10)+".json"; a.click();
+    }catch(e){ alert("Не удалось выгрузить: "+(e&&e.message||e)); }
+  }
+  render(){
+    if(this.state.err){
+      const E=React.createElement;
+      return E("div",{style:{padding:"32px 20px",maxWidth:520,margin:"40px auto",fontFamily:"Inter,-apple-system,sans-serif",color:"#1C1C1E"}},
+        E("h2",{style:{fontSize:20,margin:"0 0 8px"}},"Что-то сломалось"),
+        E("p",{style:{color:"#636366",fontSize:14,margin:"0 0 20px",lineHeight:1.5}},"Приложение столкнулось с ошибкой. Данные в безопасности — скачайте резервную копию, затем перезагрузите."),
+        E("div",{style:{display:"flex",gap:10,flexWrap:"wrap"}},
+          E("button",{onClick:()=>this.rescue(),style:{padding:"10px 18px",borderRadius:9,border:"none",background:"#2C5EE8",color:"#fff",fontWeight:600,cursor:"pointer",fontSize:14}},"⬇ Скачать резервную копию"),
+          E("button",{onClick:()=>location.reload(),style:{padding:"10px 18px",borderRadius:9,border:"1px solid rgba(0,0,0,0.1)",background:"#fff",color:"#1C1C1E",fontWeight:600,cursor:"pointer",fontSize:14}},"↻ Перезагрузить")
+        ),
+        E("pre",{style:{marginTop:20,padding:12,background:"#FAF9F7",borderRadius:8,fontSize:11,color:"#8E8E93",whiteSpace:"pre-wrap",maxHeight:160,overflow:"auto"}},String((this.state.err&&this.state.err.stack)||this.state.err))
+      );
+    }
+    return this.props.children;
+  }
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<ErrorBoundary><App/></ErrorBoundary>);
