@@ -303,14 +303,98 @@ document.addEventListener("DOMContentLoaded", function(){
 });
 </script>
 <script>
-/* Ошибки идут только в консоль — без пугающей красной плашки поверх интерфейса.
+/* Ошибки: копим в буфер (нужно для диагностики на телефоне, где нет консоли) и
+   показываем компактную плашку внизу — её можно закрыть. Это НЕ прежний красный
+   баннер во весь экран: он появляется только при реальной ошибке и не мешает работе.
    Реальные краши рендера ловит ErrorBoundary и показывает дружелюбный экран. */
+window.__fhqErrors = [];
+function fhqLogErr(kind, msg, extra){
+  try{
+    window.__fhqErrors.push({kind:kind, msg:String(msg||""), extra:String(extra||""), at:new Date().toISOString()});
+    if(window.__fhqErrors.length>20) window.__fhqErrors.shift();
+    console.error(kind+":", msg, extra||"");
+    fhqShowErrToast(String(msg||"неизвестная ошибка"));
+  }catch(_){}
+}
+function fhqShowErrToast(msg){
+  try{
+    if(localStorage.getItem("fhq_hide_err")==="1") return;
+    var box=document.getElementById("fhq-err-toast");
+    if(!box){
+      box=document.createElement("div");
+      box.id="fhq-err-toast";
+      box.style.cssText="position:fixed;left:10px;right:10px;bottom:calc(env(safe-area-inset-bottom,0px) + 10px);z-index:100000;background:#7F1D1D;color:#fff;border-radius:10px;padding:9px 12px;font:12px/1.4 'Inter',-apple-system,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.35);display:flex;gap:10px;align-items:flex-start";
+      document.body.appendChild(box);
+    }
+    box.innerHTML='<div style="flex:1;word-break:break-word"><b>Ошибка</b><br>'+
+      String(msg).replace(/[<>&]/g,"")+'</div>'+
+      '<button id="fhq-err-x" style="background:rgba(255,255,255,.15);border:none;color:#fff;border-radius:6px;padding:4px 9px;font-size:12px;cursor:pointer">×</button>';
+    var x=document.getElementById("fhq-err-x");
+    if(x) x.onclick=function(){ box.remove(); };
+  }catch(_){}
+}
 window.addEventListener("error",function(e){
-  try{console.error("Ошибка:",e.message,e.filename?(e.filename+":"+e.lineno):"",e.error&&e.error.stack?e.error.stack:"");}catch(_){}
+  fhqLogErr("Ошибка", e.message, (e.filename?(e.filename+":"+e.lineno):""));
 });
 window.addEventListener("unhandledrejection",function(e){
-  try{console.error("Необработанное отклонение:",e.reason);}catch(_){}
+  var r=e.reason; fhqLogErr("Сбой запроса", (r&&r.message)||r, "");
 });
+
+/* Сторож белого экрана: если через 8 секунд в приложении так и не появилось
+   содержимое — показываем аварийный экран с причиной и вариантами восстановления.
+   Данные при этом не трогаются. */
+(function(){
+  function boot(){
+    setTimeout(function(){
+      var root=document.getElementById("root");
+      if(root && root.children.length>0) return; // всё отрисовалось — сторож не нужен
+      var errs=(window.__fhqErrors||[]).map(function(x){return x.kind+": "+x.msg+(x.extra?(" ("+x.extra+")"):"");}).join("\n") || "Приложение не запустилось, но ошибок не зафиксировано. Чаще всего помогает «Обновить приложение» — старая версия могла остаться в кэше телефона.";
+      var safe=localStorage.getItem("fhq_safe_mode")==="1";
+      var d=document.createElement("div");
+      d.style.cssText="position:fixed;inset:0;z-index:100001;background:#fff;color:#1C1C1E;font:14px/1.5 'Inter',-apple-system,sans-serif;padding:24px 18px;overflow:auto";
+      d.innerHTML='<h2 style="font-size:19px;margin:0 0 8px">Приложение не открылось</h2>'+
+        '<p style="color:#636366;margin:0 0 16px">Ваши данные на месте — они хранятся в памяти телефона. Сначала скачайте резервную копию, потом попробуйте варианты ниже.</p>'+
+        '<div style="display:flex;flex-direction:column;gap:9px;max-width:420px">'+
+        '<button id="fhq-b1" style="padding:12px;border:none;border-radius:9px;background:#2C5EE8;color:#fff;font-weight:700;font-size:14px">⬇ Скачать резервную копию</button>'+
+        '<button id="fhq-b2" style="padding:12px;border:1px solid #ddd;border-radius:9px;background:#fff;font-weight:600;font-size:14px">↻ Обновить приложение (сбросить кэш)</button>'+
+        '<button id="fhq-b3" style="padding:12px;border:1px solid #ddd;border-radius:9px;background:#fff;font-weight:600;font-size:14px">'+(safe?"Выключить безопасный режим":"🛟 Запустить в безопасном режиме")+'</button>'+
+        '</div>'+
+        '<p style="color:#8E8E93;font-size:11.5px;margin:16px 0 6px">Что произошло (покажите это мне, если не поможет):</p>'+
+        '<pre style="background:#FAF9F7;border-radius:8px;padding:11px;font-size:11px;color:#636366;white-space:pre-wrap;word-break:break-word">'+errs.replace(/[<>&]/g,"")+'</pre>';
+      document.body.appendChild(d);
+      document.getElementById("fhq-b1").onclick=function(){
+        try{
+          var out={_exported:new Date().toISOString(),_rescue:true};
+          for(var i=0;i<localStorage.length;i++){
+            var k=localStorage.key(i);
+            if(k&&(k.indexOf("lhq_")===0||k.indexOf("fhq_")===0)){
+              try{ out[k.replace(/^lhq_|^fhq_/,"")]=JSON.parse(localStorage.getItem(k)); }catch(_){ }
+            }
+          }
+          var b=new Blob([JSON.stringify(out,null,2)],{type:"application/json"});
+          var a=document.createElement("a"); a.href=URL.createObjectURL(b);
+          a.download="fizmat_rescue_"+new Date().toISOString().slice(0,10)+".json"; a.click();
+        }catch(e){ alert("Не удалось выгрузить: "+(e&&e.message||e)); }
+      };
+      document.getElementById("fhq-b2").onclick=function(){
+        var done=function(){ location.replace(location.pathname+"?r="+Date.now()); };
+        try{
+          var jobs=[];
+          if(window.caches&&caches.keys) jobs.push(caches.keys().then(function(ks){return Promise.all(ks.map(function(k){return caches.delete(k);}));}));
+          if(navigator.serviceWorker&&navigator.serviceWorker.getRegistrations)
+            jobs.push(navigator.serviceWorker.getRegistrations().then(function(rs){return Promise.all(rs.map(function(r){return r.unregister();}));}));
+          Promise.all(jobs).then(done,done);
+          setTimeout(done,2500);
+        }catch(_){ done(); }
+      };
+      document.getElementById("fhq-b3").onclick=function(){
+        try{ if(safe) localStorage.removeItem("fhq_safe_mode"); else localStorage.setItem("fhq_safe_mode","1"); }catch(_){}
+        location.reload();
+      };
+    }, 8000);
+  }
+  if(document.readyState==="loading") document.addEventListener("DOMContentLoaded",boot); else boot();
+})();
 </script>
 <script type="text/babel">
 const{useState,useMemo,useCallback,useEffect,useRef,Fragment}=React;
@@ -512,9 +596,10 @@ async function idbGet(k){
 /* Объединяет два массива записей по id (union). Сохраняет обе стороны;
    при совпадении id берёт запись с более свежим updatedAt, иначе — облачную.
    Именно это устраняет затирание данных при работе с двух устройств. */
-function mergeById(local,cloud){
+function mergeById(local,cloud,tombs){
   if(!Array.isArray(local)) return Array.isArray(cloud)?cloud:local;
   if(!Array.isArray(cloud)) return local;
+  const tm=tombs||{};
   const byId=new Map(), noId=[], seen=new Set();
   const push=(it,fromCloud)=>{
     if(it && it.id!=null){
@@ -530,7 +615,27 @@ function mergeById(local,cloud){
   };
   local.forEach(it=>push(it,false));
   cloud.forEach(it=>push(it,true));
-  return [...byId.values(), ...noId];
+  // Убираем то, что было удалено, если правка не новее удаления.
+  const res=[];
+  byId.forEach((it,k)=>{
+    const del=tm[k];
+    if(del){
+      const upd=Date.parse(it.updatedAt||it.createdAt||"")||0;
+      if(upd<=(Date.parse(del)||0)) return;   // удаление новее правки — не возвращаем
+    }
+    res.push(it);
+  });
+  return [...res, ...noId];
+}
+// Объединение реестров удалений двух устройств (побеждает более позднее).
+function tombMerge(a,b){
+  const out={};
+  const put=src=>{ Object.keys(src||{}).forEach(key=>{
+    const m=out[key]||(out[key]={}), s=src[key]||{};
+    Object.keys(s).forEach(id=>{ if(!m[id]||(Date.parse(s[id])||0)>(Date.parse(m[id])||0)) m[id]=s[id]; });
+  }); };
+  put(a); put(b);
+  return out;
 }
 
 /* Баннер о неудачной записи в localStorage (переполнено хранилище). */
@@ -566,12 +671,29 @@ const CAL_START=8, CAL_END=22;
 const CAL_HOURS=Array.from({length:CAL_END-CAL_START},(_,i)=>CAL_START+i);
 const ET=[
   {v:"lesson",l:"Урок",c:"#2C5EE8"},
+  {v:"school",l:"Школа",c:"#0E7490"},
   {v:"work",l:"Работа",c:"#7C3AED"},
   {v:"study",l:"Учёба",c:"#C47C00"},
   {v:"personal",l:"Личное",c:"#2A9D5C"},
   {v:"project",l:"Проект",c:"#5B5BD6"},
   {v:"important",l:"Важное",c:"#D63A3A"}
 ];
+// Начислено за период: сумма по урокам вне зависимости от того, оплачены они или нет.
+// Отменённые не считаем. Цена берётся из события, иначе из ставки ученика.
+function accrued(list,students){
+  return (Array.isArray(list)?list:[]).reduce((sum,e)=>{
+    if(!e||e.type!=="lesson"||e.status==="cancelled")return sum;
+    const st=(Array.isArray(students)?students:[]).find(s=>sameId(s.id,e.studentId));
+    return sum+(Number(e.price!=null&&e.price!==""?e.price:(st&&st.price))||0);
+  },0);
+}
+// Все занятия недели: реальные события + сгенерированные из шаблонов (без дублей).
+function weekLessonList(events,rls,excs,students,wS,wE){
+  const real=(Array.isArray(events)?events:[]).filter(e=>e&&e.date>=wS&&e.date<=wE);
+  const rec=genRec(rls,excs,students,wS,wE)
+    .filter(r=>!real.some(e=>e.date===r.date&&e.time===r.time&&sameId(e.studentId,r.studentId)));
+  return [...real,...rec];
+}
 const EV_ST={planned:"Запланировано",done:"Проведено",cancelled:"Отменено",moved:"Перенесено",missed:"Неявка"};
 const ECATS=["Техника","Транспорт","Обучение","Подписки","Реклама","Личные","Другое"];
 const PMETHODS=["После каждого занятия","Раз в 2 недели (после)","За 2 недели вперёд","За месяц вперёд","В конце месяца","Свободный график"];
@@ -583,6 +705,55 @@ const BTAGS=["Физика","Математика","Уроки","Telegram","Ли
 const SUBJ_COLORS={"Физика":"#2C5EE8","Математика":"#7C3AED","Информатика":"#2A9D5C","Химия":"#C47C00","Другое":"#636366"};
 
 /* ── STORE ───────────────────────────────────────────────────── */
+/* ── УЧЁТ УДАЛЕНИЙ И ПРАВОК ДЛЯ СИНХРОНИЗАЦИИ ──────────────────────────────
+   Раньше слияние с облаком было объединением (union): оно не умело выражать
+   удаление, поэтому удалённая на одном устройстве запись возвращалась с другого.
+   Теперь каждое удаление оставляет «надгробие» (id + время), а каждая правка —
+   отметку updatedAt. Это позволяет слиянию понять, что новее: правка или удаление. */
+const TOMB_KEY="fhq_tombs";
+function tombLoad(){ try{ return JSON.parse(localStorage.getItem(TOMB_KEY)||"{}")||{}; }catch(_){ return {}; } }
+function tombSave(t){ try{ localStorage.setItem(TOMB_KEY,JSON.stringify(t)); }catch(_){ } }
+// Отмечаем удалённые и снимаем отметку с вернувшихся (например, после «Отменить»).
+function tombUpdate(key,goneIds,presentIds,at){
+  const t=tombLoad();
+  const m=t[key]||{};
+  let changed=false;
+  (goneIds||[]).forEach(id=>{ m[String(id)]=at; changed=true; });
+  (presentIds||[]).forEach(id=>{ if(m[String(id)]){ delete m[String(id)]; changed=true; } });
+  if(!changed) return;
+  // Подрезаем записи старше 180 дней, чтобы реестр не рос бесконечно.
+  const cut=Date.now()-180*864e5;
+  Object.keys(m).forEach(id=>{ if((Date.parse(m[id])||0)<cut) delete m[id]; });
+  t[key]=m; tombSave(t);
+}
+function sameExceptStamp(a,b){
+  try{
+    const x=Object.assign({},a),y=Object.assign({},b);
+    delete x.updatedAt; delete y.updatedAt;
+    return JSON.stringify(x)===JSON.stringify(y);
+  }catch(_){ return false; }
+}
+// Проставляет updatedAt новым/изменённым записям и фиксирует удаления.
+function trackChanges(key,prev,next){
+  if(!Array.isArray(prev)||!Array.isArray(next)) return next;
+  const at=new Date().toISOString();
+  const pm=new Map();
+  prev.forEach(it=>{ if(it&&it.id!=null) pm.set(String(it.id),it); });
+  const present=[],seen=new Set();
+  const out=next.map(it=>{
+    if(!it||typeof it!=="object"||it.id==null) return it;
+    const k=String(it.id); seen.add(k); present.push(k);
+    const old=pm.get(k);
+    if(!old) return it.updatedAt?it:Object.assign({},it,{updatedAt:at});
+    if(sameExceptStamp(old,it)) return it;
+    return Object.assign({},it,{updatedAt:at});
+  });
+  const gone=[];
+  pm.forEach((_v,k)=>{ if(!seen.has(k)) gone.push(k); });
+  if(gone.length||present.length) tombUpdate(key,gone,present,at);
+  return out;
+}
+
 function useStore(key,def){
   const[v,sv]=useState(()=>{try{const x=localStorage.getItem(key);return x?JSON.parse(x):def;}catch{return def;}});
   // Если в localStorage пусто (напр. после очистки кэша) — поднимаем из IndexedDB.
@@ -599,7 +770,8 @@ function useStore(key,def){
   },[key]);
   const set=useCallback(nv=>{
     sv(prev=>{
-      const r=typeof nv==="function"?nv(prev):nv;
+      const raw=typeof nv==="function"?nv(prev):nv;
+      const r=trackChanges(key,prev,raw);
       const s=JSON.stringify(r);
       try{ localStorage.setItem(key,s); }catch{ warnStorage(); }
       idbSet(key,s); // зеркало best-effort
@@ -658,11 +830,15 @@ function genRec(rls,excs,students,from,to){
       const wd=cur.getDay()===0?7:cur.getDay();
       if(wd===r.weekday){
         const dk=iso(cur);
-        if((!r.startDate||dk>=r.startDate)&&(!r.endDate||dk<=r.endDate)&&!excs.some(e=>e.recurringId===r.id&&e.date===dk))
+        if((!r.startDate||dk>=r.startDate)&&(!r.endDate||dk<=r.endDate)&&!excs.some(e=>e.recurringId===r.id&&e.date===dk)){
+          const isSchool=r.type==="school";
           res.push({id:`rec_${r.id}_${dk}`,isRecurring:true,recurringId:r.id,
-            studentId:r.studentId,title:st?.name||"Урок",type:"lesson",date:dk,
+            studentId:isSchool?undefined:r.studentId,
+            title:isSchool?(r.title||"Школа"):(st?.name||"Урок"),
+            type:isSchool?"school":"lesson",date:dk,
             time:r.time,duration:r.duration,status:"planned",
-            price:r.priceOverride!=null?r.priceOverride:(st?.price||0)});
+            price:isSchool?0:(r.priceOverride!=null?r.priceOverride:(st?.price||0))});
+        }
       }
       cur.setDate(cur.getDate()+1);
     }
@@ -1486,9 +1662,8 @@ function WeekView({store}){
     ...recEv.filter(r=>!events.some(e=>e.date===r.date&&e.time===r.time&&e.studentId===r.studentId))];
   const lessons=allEv.filter(e=>e.type==="lesson");
   const inc=incomes.filter(i=>i.date>=wS&&i.date<=wE).reduce((s,i)=>s+(Number(i.amount)||0),0);
-  const planInc=lessons.filter(e=>e.status==="planned").reduce((s,l)=>{
-    const st=students.find(x=>x.id===l.studentId);return s+(Number(l.price||st?.price)||0);
-  },0);
+  // Начислено за неделю: все уроки (и проведённые, и запланированные), без учёта оплаты.
+  const planInc=accrued(lessons,students);
   const hrs=lessons.reduce((s,l)=>s+(Number(l.duration)||60)/60,0);
   const urgTasks=tasks.filter(t=>t.status!=="done"&&t.deadline&&t.deadline>=wS&&t.deadline<=wE).sort((a,b)=>a.deadline>b.deadline?1:-1);
   const now=new Date(),mStr=localYM(now);
@@ -1553,7 +1728,7 @@ function WeekView({store}){
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
             {[
               {v:`${fmtM(inc)} ₽`,l:"Доход (факт)",c:T.green,bg:"#EDFBF3"},
-              {v:`+${fmtM(planInc)} ₽`,l:"Прогноз",c:T.accent,bg:"#EEF2FF"},
+              {v:`${fmtM(planInc)} ₽`,l:"Начислено",c:T.accent,bg:"#EEF2FF"},
               {v:lessons.length,l:"Уроков",c:T.accent2,bg:"#F3F0FF"},
               {v:`${hrs.toFixed(1)} ч`,l:"Часов",c:T.amber,bg:"#FFFBEB"},
             ].map(x=>(
@@ -1563,6 +1738,29 @@ function WeekView({store}){
               </div>
             ))}
           </div>
+
+          {(()=>{
+            const sch=allEv.filter(e=>e&&e.type==="school"&&e.status!=="cancelled");
+            if(sch.length===0)return null;
+            const sh=sch.reduce((s,e)=>s+(Number(e.duration)||60)/60,0);
+            const byDay=dates.map(d=>({d,n:sch.filter(e=>e.date===iso(d)).length})).filter(x=>x.n>0);
+            return(
+              <Card pad={14}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:8}}>
+                  <div style={{fontSize:12,fontWeight:700,letterSpacing:"-0.02em"}}>Школа</div>
+                  <div style={{fontSize:11,color:T.t3}}>{sch.length} занятий · {sh.toFixed(1)} ч</div>
+                </div>
+                <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                  {byDay.map(x=>(
+                    <div key={iso(x.d)} style={{background:"#0E749018",color:"#0E7490",borderRadius:7,padding:"4px 9px",fontSize:11,fontWeight:700}}>
+                      {DF[(x.d.getDay()===0?7:x.d.getDay())-1]} · {x.n}
+                    </div>
+                  ))}
+                </div>
+                <div style={{fontSize:10.5,color:T.t3,marginTop:8,lineHeight:1.4}}>Школьные часы не входят в доход от репетиторства и не влияют на долги учеников.</div>
+              </Card>
+            );
+          })()}
 
           <Card pad={14}>
             <div style={{fontSize:12,fontWeight:700,marginBottom:10,letterSpacing:"-0.02em"}}>Нагрузка дней</div>
@@ -1878,6 +2076,18 @@ function CalPage({store,openNew,onOpenNew}){
               <Btn variant="secondary" size="sm" onClick={()=>setWo(0)}>Сег</Btn>
               <Btn variant="secondary" size="sm" onClick={()=>setWo(o=>o+1)}>→</Btn>
               <Btn variant="secondary" size="sm" onClick={exportWeekPDF}>⤓ PDF</Btn>
+              {(()=>{
+                const wS=iso(dates[0]),wE=iso(dates[6]);
+                const list=weekLessonList(events,rls,excs,students,wS,wE);
+                const sum=accrued(list,students);
+                const cnt=list.filter(e=>e&&e.type==="lesson"&&e.status!=="cancelled").length;
+                return <div title="Начислено за неделю по ставкам учеников (независимо от оплаты)"
+                  style={{marginLeft:"auto",display:"flex",alignItems:"baseline",gap:6,padding:"4px 11px",borderRadius:8,background:"var(--surface2)",border:`1px solid ${T.border}`,whiteSpace:"nowrap"}}>
+                  <span style={{fontSize:10,color:T.t3,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.05em"}}>за неделю</span>
+                  <span style={{fontSize:14,fontWeight:800,letterSpacing:"-0.02em"}}>{fmtM(sum)} ₽</span>
+                  <span style={{fontSize:10.5,color:T.t3}}>{cnt} ур.</span>
+                </div>;
+              })()}
             </>
           ):(
             <>
@@ -2144,7 +2354,9 @@ function RecurringPage({store}){
   const[modal,setModal]=useState(false);const[form,setForm]=useState({});
   const f=(k,v)=>setForm(p=>({...p,[k]:v}));
   function save(){
-    if(!form.studentId){alert("Выберите ученика для шаблона.");return;}
+    const isSchool=(form.type||"lesson")==="school";
+    if(!isSchool&&!form.studentId){alert("Выберите ученика для шаблона.");return;}
+    if(isSchool&&!(form.title||"").trim()){alert("Укажите название (например: Школа · 8А алгебра).");return;}
     const rl={...form,id:form.id||Date.now(),active:form.active!==false,weekday:Number(form.weekday)||1,duration:Number(form.duration)||60,startDate:form.startDate?form.startDate:(form.id?undefined:today()),priceOverride:form.priceOverride!==""&&form.priceOverride!=null?Number(form.priceOverride):null};
     if(!form.id){
       // Ищем реальные накладки по времени на ближайшие 6 месяцев (а не только точные совпадения).
@@ -2182,13 +2394,13 @@ function RecurringPage({store}){
               <Card key={r.id} hover style={{opacity:r.active?1:0.55,cursor:"pointer"}} onClick={()=>{setForm({...r,priceOverride:r.priceOverride??""});setModal(true);}}>
                 <div style={{display:"flex",justifyContent:"space-between",marginBottom:12}}>
                   <div>
-                    <div style={{fontSize:14,fontWeight:700,letterSpacing:"-0.02em"}}>{st?.name||"Ученик"}</div>
-                    <div style={{fontSize:11,color:T.t3,marginTop:1}}>{st?.subject}{st?.grade?` · ${st.grade} кл`:""}</div>
+                    <div style={{fontSize:14,fontWeight:700,letterSpacing:"-0.02em"}}>{r.type==="school"?(r.title||"Школа"):(st?.name||"Ученик")}</div>
+                    <div style={{fontSize:11,color:T.t3,marginTop:1}}>{r.type==="school"?"Школа":<>{st?.subject}{st?.grade?` · ${st.grade} кл`:""}</>}</div>
                   </div>
                   <Badge color={r.active?T.green:"#9CA3AF"} size="sm" dot>{r.active?"Активно":"Пауза"}</Badge>
                 </div>
                 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
-                  {[["День",DF[r.weekday-1]||""],["Время",r.time?.slice(0,5)],["Длит.",`${r.duration}м`],["Цена",`${fmtM(r.priceOverride??st?.price??0)} ₽`]].map(([l,v])=>(
+                  {[["День",DF[r.weekday-1]||""],["Время",r.time?.slice(0,5)],["Длит.",`${r.duration}м`],["Цена",r.type==="school"?"—":`${fmtM(r.priceOverride??st?.price??0)} ₽`]].map(([l,v])=>(
                     <div key={l} style={{background:T.surface2,borderRadius:8,padding:"6px 9px",border:`1px solid ${T.border}`}}>
                       <div style={{fontSize:9,color:T.t3,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.04em"}}>{l}</div>
                       <div style={{fontSize:11,fontWeight:700,marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{v}</div>
@@ -2203,12 +2415,22 @@ function RecurringPage({store}){
       )}
       {modal&&(
         <Modal title={form.id?"Редактировать шаблон":"Новый шаблон"} onClose={()=>setModal(false)}>
-          <Field label="Ученик"><Sel value={form.studentId} onChange={v=>f("studentId",Number(v))} options={[{v:"",l:"— выбрать —"},...students.map(s=>({v:s.id,l:`${s.name} · ${s.subject}`}))]}/></Field>
+          <Field label="Тип">
+            <div style={{display:"flex",gap:6}}>
+              {[{v:"lesson",l:"Урок с учеником",c:"#2C5EE8"},{v:"school",l:"Школа",c:"#0E7490"}].map(o=>{
+                const on=(form.type||"lesson")===o.v;
+                return <button key={o.v} onClick={()=>f("type",o.v)} style={{padding:"6px 14px",borderRadius:8,border:"none",cursor:"pointer",fontWeight:600,fontSize:12,fontFamily:"var(--font)",background:on?o.c:o.c+"18",color:on?"#fff":o.c}}>{o.l}</button>;
+              })}
+            </div>
+          </Field>
+          {(form.type||"lesson")==="school"
+            ? <Field label="Название"><Inp value={form.title||""} onChange={v=>f("title",v)} placeholder="Школа · 8А алгебра"/></Field>
+            : <Field label="Ученик"><Sel value={form.studentId} onChange={v=>f("studentId",Number(v))} options={[{v:"",l:"— выбрать —"},...students.map(s=>({v:s.id,l:`${s.name} · ${s.subject}`}))]}/></Field>}
           <G2>
             <Field label="День недели"><Sel value={form.weekday} onChange={v=>f("weekday",Number(v))} options={DF.map((d,i)=>({v:i+1,l:d}))}/></Field>
             <Field label="Время"><Inp type="time" value={form.time} onChange={v=>f("time",v)}/></Field>
             <Field label="Длительность (мин)"><Inp type="number" value={form.duration} onChange={v=>f("duration",v)}/></Field>
-            <Field label="Переопределить цену (₽)"><Inp type="number" value={form.priceOverride} onChange={v=>f("priceOverride",v)} placeholder="Из карточки ученика"/></Field>
+            {(form.type||"lesson")==="lesson"&&<Field label="Переопределить цену (₽)"><Inp type="number" value={form.priceOverride} onChange={v=>f("priceOverride",v)} placeholder="Из карточки ученика"/></Field>}
           </G2>
           <Field label="Начало (уроки идут с этой даты)"><Inp type="date" value={form.startDate||""} onChange={v=>f("startDate",v)}/></Field>
           <Field label="Активно"><Toggle on={form.active!==false} onChange={v=>f("active",v)} label="Шаблон активен"/></Field>
@@ -3822,6 +4044,10 @@ function App(){
   const[homeTiles,setHomeTiles]=useStore("fhq_hometiles",null);
   const[pageStyles,setPageStyles]=useStore("fhq_pagestyles",{});
   // Двусторонняя синхронизация с Google Календарём (по умолчанию ВЫКЛЮЧЕНА).
+  // Безопасный режим: включается с аварийного экрана. Отключает синхронизацию с
+  // календарём и автозагрузку с Диска, чтобы приложение точно открылось и данные
+  // можно было выгрузить.
+  const safeMode=(()=>{try{return localStorage.getItem("fhq_safe_mode")==="1";}catch(_){return false;}})();
   const[gcalOn,setGcalOn]=useStore("fhq_gcal_on",false);
   const[gcalMeta,setGcalMeta]=useStore("fhq_gcal_meta",{});      // {syncToken,lastSyncAt,lastResult,lastError}
   const[gcalTomb,setGcalTomb]=useStore("fhq_gcal_tomb",[]);      // удалённые локально: [{gcalId,at}]
@@ -3832,41 +4058,58 @@ function App(){
   useEffect(()=>{if(pageStyles&&pageStyles.accent){document.documentElement.style.setProperty("--accent",pageStyles.accent);}},[pageStyles]);
 
   const migratedRef=useRef(false);
-  useEffect(()=>{
+  const pullBusyRef=useRef(false);
+  // Забирает данные с Диска и объединяет с локальными, учитывая удаления.
+  const pullCloud=useCallback((opts)=>{
     const saved=localStorage.getItem("fhq_gdrive_token");
-    if(saved&&user&&user.type==="google"&&!migratedRef.current){
-      migratedRef.current=true;
-      gToken=saved;
-      setSyncStatus("syncing");
-      gLoad(saved).then(cloud=>{
-        if(cloud){
-          // Объединяем облако с локальными данными по id — ничего не затирается.
-          const mrg=(setter,arr)=>setter(prev=>mergeById(prev, arr||[]));
-          mrg(setStudents,  cloud.students);
-          mrg(setEvents,    cloud.events);
-          mrg(setTasks,     cloud.tasks);
-          mrg(setPayments,  cloud.payments);
-          mrg(setIncomes,   cloud.incomes);
-          mrg(setExpenses,  cloud.expenses);
-          mrg(setBrain,     cloud.brain);
-          mrg(setKb,        cloud.kb);
-          mrg(setJournal,   cloud.journal);
-          mrg(setProjects,  cloud.projects);
-          mrg(setGoals,     cloud.goals);
-          mrg(setRls,       cloud.rls);
-          mrg(setExcs,      cloud.excs);
-          mrg(setExpTpl,    cloud.expTpl);
-          mrg(setLessonLog, cloud.lessonLog);
-          mrg(setIdeas,     cloud.ideas);    // раньше не синхронизировались
-          mrg(setOffline,   cloud.offline);  // раньше не синхронизировались
-          if(cloud.dockOrder)setDockOrder(cloud.dockOrder);
-          if(cloud.homeTiles)setHomeTiles(cloud.homeTiles);
-          if(cloud.pageStyles)setPageStyles(cloud.pageStyles);
-        }
-        setSyncStatus("synced");
-      }).catch(()=>setSyncStatus("error"));
-    }
+    if(!saved||!user||user.type!=="google") return;
+    if(pullBusyRef.current) return;
+    pullBusyRef.current=true;
+    gToken=saved;
+    setSyncStatus("syncing");
+    gLoad(saved).then(cloud=>{
+      if(cloud){
+        // Реестры удалений двух устройств объединяем, затем применяем при слиянии.
+        const tombs=tombMerge(tombLoad(), cloud._tombs||{});
+        tombSave(tombs);
+        const mrg=(setter,arr,key)=>setter(prev=>mergeById(prev, arr||[], tombs[key]||{}));
+        mrg(setStudents,  cloud.students,  "lhq_students");
+        mrg(setEvents,    cloud.events,    "lhq_events");
+        mrg(setTasks,     cloud.tasks,     "lhq_tasks");
+        mrg(setPayments,  cloud.payments,  "lhq_payments");
+        mrg(setIncomes,   cloud.incomes,   "lhq_incomes");
+        mrg(setExpenses,  cloud.expenses,  "lhq_expenses");
+        mrg(setBrain,     cloud.brain,     "lhq_brain");
+        mrg(setKb,        cloud.kb,        "lhq_kb");
+        mrg(setJournal,   cloud.journal,   "lhq_journal");
+        mrg(setProjects,  cloud.projects,  "lhq_projects");
+        mrg(setGoals,     cloud.goals,     "lhq_goals");
+        mrg(setRls,       cloud.rls,       "lhq_recurring");
+        mrg(setExcs,      cloud.excs,      "lhq_exceptions");
+        mrg(setExpTpl,    cloud.expTpl,    "lhq_exptpl");
+        mrg(setLessonLog, cloud.lessonLog, "lhq_lessonlog");
+        mrg(setIdeas,     cloud.ideas,     "lhq_ideas");
+        mrg(setOffline,   cloud.offline,   "lhq_offline");
+        if(cloud.dockOrder&&(!opts||!opts.quiet))setDockOrder(cloud.dockOrder);
+        if(cloud.homeTiles&&(!opts||!opts.quiet))setHomeTiles(cloud.homeTiles);
+        if(cloud.pageStyles&&(!opts||!opts.quiet))setPageStyles(cloud.pageStyles);
+      }
+      setSyncStatus("synced");
+    }).catch(()=>setSyncStatus("error"))
+      .then(()=>{ pullBusyRef.current=false; });
   },[user]);
+
+  useEffect(()=>{
+    if(!(user&&user.type==="google")) return;
+    if(!migratedRef.current){ migratedRef.current=true; pullCloud(); }
+    // Периодически подтягиваем правки с других устройств — раньше загрузка
+    // происходила только при запуске, поэтому изменения «расходились».
+    const iv=setInterval(()=>{ if(document.visibilityState==="visible") pullCloud({quiet:true}); },60000);
+    const onVis=()=>{ if(document.visibilityState==="visible") pullCloud({quiet:true}); };
+    document.addEventListener("visibilitychange",onVis);
+    window.addEventListener("online",onVis);
+    return()=>{ clearInterval(iv); document.removeEventListener("visibilitychange",onVis); window.removeEventListener("online",onVis); };
+  },[user,pullCloud]);
 
   const syncTimerRef=useRef(null);
   const triggerSync=useCallback(()=>{
@@ -3874,7 +4117,7 @@ function App(){
     setSyncStatus("syncing");
     clearTimeout(syncTimerRef.current);
     syncTimerRef.current=setTimeout(()=>{
-      gSave({events,students,expenses,incomes,tasks,payments,rls,excs,brain,kb,journal,projects,goals,ideas,offline,expTpl,lessonLog,dockOrder,homeTiles,pageStyles,_savedAt:new Date().toISOString()})
+      gSave({events,students,expenses,incomes,tasks,payments,rls,excs,brain,kb,journal,projects,goals,ideas,offline,expTpl,lessonLog,dockOrder,homeTiles,pageStyles,_tombs:tombLoad(),_savedAt:new Date().toISOString()})
         .then(()=>setSyncStatus("synced"))
         .catch(()=>setSyncStatus("error"));
     },2000);
@@ -3947,7 +4190,7 @@ function App(){
   },[]);
 
   function expData(){
-    const d={events,students,expenses,incomes,tasks,ideas,projects,goals,journal,kb,offline,payments,rls,excs,brain,expTpl,lessonLog,dockOrder,homeTiles,pageStyles,_exported:new Date().toISOString()};
+    const d={events,students,expenses,incomes,tasks,ideas,projects,goals,journal,kb,offline,payments,rls,excs,brain,expTpl,lessonLog,dockOrder,homeTiles,pageStyles,_tombs:tombLoad(),_exported:new Date().toISOString()};
     const b=new Blob([JSON.stringify(d,null,2)],{type:"application/json"});
     const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download=`fizmat_${today()}.json`;a.click();
     try{ localStorage.setItem("fhq_last_export",String(Date.now())); }catch{}
@@ -4035,6 +4278,7 @@ function App(){
           if(d.offline)setOffline(d.offline);
           if(d.expTpl)setExpTpl(d.expTpl);
           if(d.lessonLog)setLessonLog(d.lessonLog);
+          if(d._tombs){ try{ tombSave(tombMerge(tombLoad(), d._tombs)); }catch(_){ } }
           try{ localStorage.setItem("fhq_last_export",String(Date.now())); }catch{}
           if(gToken){
             setSyncStatus("syncing");
@@ -4384,7 +4628,7 @@ function App(){
 
   // Автозапуск: при открытии, каждые 3 минуты и при возврате на вкладку.
   useEffect(()=>{
-    if(!gcalOn||!(user&&user.type==="google")) return;
+    if(!gcalOn||safeMode||!(user&&user.type==="google")) return;
     let alive=true;
     const run=()=>{ if(alive&&document.visibilityState==="visible"&&gcalFnRef.current) gcalFnRef.current({silent:true}); };
     const first=setTimeout(run,1500);
@@ -4396,7 +4640,7 @@ function App(){
 
   // Быстрая отправка после локальной правки (через 12 секунд тишины), без петель.
   useEffect(()=>{
-    if(!gcalOn||!(user&&user.type==="google")) return;
+    if(!gcalOn||safeMode||!(user&&user.type==="google")) return;
     if(gcalApplyingRef.current) return;
     const last=(gcalMeta&&gcalMeta.lastSyncAt)||"";
     const dirty=(Array.isArray(gcalTomb)&&gcalTomb.length>0)||
@@ -4623,7 +4867,7 @@ function App(){
               <button onClick={()=>{
                 if(!gToken){alert("Войдите через Google.");return;}
                 setSyncStatus("syncing");
-                gSave({events,students,expenses,incomes,tasks,payments,rls,excs,brain,kb,journal,projects,goals,ideas,offline,expTpl,lessonLog,dockOrder,homeTiles,pageStyles,_savedAt:new Date().toISOString()}).then(()=>{gFileId=null;setSyncStatus("synced");}).catch(()=>setSyncStatus("error"));
+                gSave({events,students,expenses,incomes,tasks,payments,rls,excs,brain,kb,journal,projects,goals,ideas,offline,expTpl,lessonLog,dockOrder,homeTiles,pageStyles,_tombs:tombLoad(),_savedAt:new Date().toISOString()}).then(()=>{gFileId=null;setSyncStatus("synced");}).catch(()=>setSyncStatus("error"));
               }} style={{width:"100%",background:"rgba(37,99,235,0.25)",border:"1px solid rgba(37,99,235,0.4)",borderRadius:7,padding:"6px 8px",cursor:"pointer",fontSize:10,color:"#93C5FD",fontWeight:600,fontFamily:"var(--font)"}}>↑ Сохранить на Drive</button>
               <div style={{fontSize:9,color:"var(--sidebar-muted)",textAlign:"center",marginTop:4}}>{syncStatus==="synced"?"✓ синхронизировано":syncStatus==="syncing"?"⟳ сохранение...":syncStatus==="error"?"✗ ошибка":"● Google Drive"}</div>
             </div>
